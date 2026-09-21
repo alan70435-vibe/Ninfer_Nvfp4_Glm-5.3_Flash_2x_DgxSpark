@@ -14,6 +14,9 @@ add_library(ninfer_glm53_core STATIC
     src/execution_plan.cpp
     src/parameter_schema.cpp
     src/checkpoint_binding.cpp
+    src/nvfp4_decode.cpp
+    src/tiny_layer.cpp
+    src/speculative.cpp
 )
 
 target_include_directories(ninfer_glm53_core
@@ -33,11 +36,14 @@ target_link_libraries(ninfer-glm53-plan PRIVATE ninfer_glm53_core)
 add_executable(ninfer-glm53-bind apps/ninfer_glm53_bind.cpp)
 target_link_libraries(ninfer-glm53-bind PRIVATE ninfer_glm53_core)
 
+add_executable(ninfer-glm53-generate apps/ninfer_glm53_generate.cpp)
+target_link_libraries(ninfer-glm53-generate PRIVATE ninfer_glm53_core)
+
 if(NINFER_GLM53_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding)
+    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding nvfp4_decode tiny_layer speculative)
         add_executable(test_${test_name} tests/test_${test_name}.cpp)
         target_link_libraries(test_${test_name} PRIVATE ninfer_glm53_core)
         add_test(NAME ${test_name} COMMAND test_${test_name})
