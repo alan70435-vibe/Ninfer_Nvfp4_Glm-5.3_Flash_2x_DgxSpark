@@ -1,0 +1,21 @@
+name: host-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_GLM53_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Python syntax
+        run: python3 -m py_compile scripts/checkpoint_manifest.py
+      - name: Shell syntax
+        run: bash -n scripts/preflight_dgxspark.sh
