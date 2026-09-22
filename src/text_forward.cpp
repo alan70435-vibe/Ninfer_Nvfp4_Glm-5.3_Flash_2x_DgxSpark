@@ -57,6 +57,43 @@ float bf16_to_f32(std::uint16_t bits) {
     return out;
 }
 
+std::uint8_t f32_to_e4m3(float value) {
+    if (std::isnan(value)) return 0x7f;
+    const bool negative = std::signbit(value);
+    float magnitude = std::fabs(value);
+    if (magnitude == 0.f) return negative ? 0x80 : 0x00;
+    if (magnitude > 448.f) magnitude = 448.f;
+    int exponent = 0;
+    const float fraction = std::frexp(magnitude, &exponent);
+    float normal = fraction * 2.f;
+    int biased = exponent - 1 + 7;
+    if (biased <= 0) {
+        int mantissa = static_cast<int>(std::nearbyint(std::ldexp(magnitude, 9)));
+        if (mantissa > 7) mantissa = 7;
+        if (mantissa < 0) mantissa = 0;
+        return static_cast<std::uint8_t>((negative ? 0x80 : 0) | mantissa);
+    }
+    if (biased > 15) return static_cast<std::uint8_t>((negative ? 0x80 : 0) | 0x7e);
+    int mantissa = static_cast<int>(std::nearbyint((normal - 1.f) * 8.f));
+    if (mantissa == 8) {
+        mantissa = 0;
+        ++biased;
+        if (biased > 15) return static_cast<std::uint8_t>((negative ? 0x80 : 0) | 0x7e);
+    }
+    if (biased >= 15 && mantissa > 6) return static_cast<std::uint8_t>((negative ? 0x80 : 0) | 0x7e);
+    return static_cast<std::uint8_t>((negative ? 0x80 : 0) | (biased << 3) | mantissa);
+}
+
+std::uint16_t f32_to_bf16(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t lsb = (bits >> 16) & 1U;
+    const std::uint32_t round = 0x7fffU + lsb;
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return static_cast<std::uint16_t>(bits >> 16);
+    bits += round;
+    return static_cast<std::uint16_t>(bits >> 16);
+}
+
 constexpr std::chrono::seconds kRankIoBudget{30};
 
 [[nodiscard]] bool wait_fd(int fd, int events, std::chrono::steady_clock::time_point deadline) {
@@ -530,6 +567,9 @@ public:
         for (std::size_t layer = 0; layer < spec_.layers.size(); ++layer) {
             mix(static_cast<int>(layer), spec_.layers[layer].mixer, "hc_attn_", "input_layernorm.weight");
             feed(static_cast<int>(layer), spec_.layers[layer].ffn);
+            // Serving kernels store each mHC stream in bf16. fp32 streams
+            // move a close argmax once the capture KDA state is present.
+            for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
             if (capture_taps_) record_tap(static_cast<int>(layer));
         }
         std::vector<float> mean(static_cast<std::size_t>(hidden_), 0.f);
@@ -596,6 +636,17 @@ public:
     }
 
     void set_capture(bool enabled) { capture_taps_ = enabled; }
+
+    // CUDA-graph capture fills input ids with token 0. The serving block
+    // zeroer clears attention pages and skips mamba, so a fresh request
+    // reads that KDA state with an empty MLA cache.
+    void prime_capture_kda() {
+        step(0);
+        for (auto& cache : mla_) {
+            cache.latents.clear();
+            cache.tokens = 0;
+        }
+    }
 
     [[nodiscard]] const float* tap(int index) const { return taps_[static_cast<std::size_t>(index)].data(); }
 
@@ -844,6 +895,21 @@ private:
         std::vector<float> kv_norm(static_cast<std::size_t>(kv_lora_));
         store_.load(prefix + "kv_a_layernorm.weight", kv_norm.data(), kv_lora_);
         rmsnorm(buf_a_.data(), kv_norm.data(), kv_lora_, rms_eps_, buf_a_.data());
+        // fp8_ds_mla stores each 128-wide latent group as e4m3 with scale amax/448.
+        if (kv_lora_ % 128 == 0) {
+            for (int block = 0; block < kv_lora_; block += 128) {
+                float peak = 0.f;
+                for (int lane = 0; lane < 128; ++lane) {
+                    peak = std::max(peak, std::fabs(buf_a_[static_cast<std::size_t>(block + lane)]));
+                }
+                if (peak == 0.f) continue;
+                const float scale = peak / 448.f;
+                for (int lane = 0; lane < 128; ++lane) {
+                    float& slot = buf_a_[static_cast<std::size_t>(block + lane)];
+                    slot = fp8_e4m3_to_f32(f32_to_e4m3(slot / scale)) * scale;
+                }
+            }
+        }
         auto& cache = mla_[static_cast<std::size_t>(layer)];
         cache.latents.insert(cache.latents.end(), buf_a_.begin(), buf_a_.begin() + kv_lora_);
         ++cache.tokens;
@@ -1277,7 +1343,8 @@ void causal_conv_silu(const float* x, const float* weight, float* mem, int chann
         if (history <= 0) continue;
         float* state = mem + static_cast<std::size_t>(channel) * static_cast<std::size_t>(history);
         for (int tap = 0; tap < history - 1; ++tap) state[tap] = state[tap + 1];
-        state[history - 1] = raw;
+        // The serving conv cache is bf16. The next token reads this raw value.
+        state[history - 1] = bf16_to_f32(f32_to_bf16(raw));
     }
 }
 
@@ -1414,6 +1481,7 @@ bool fixed_prompt_tokens(std::string_view prompt_id, std::string& text, std::vec
 namespace {
 
 std::vector<std::int32_t> greedy_tokens(TextModel& model, const std::vector<std::int32_t>& prompt, int new_tokens) {
+    model.prime_capture_kda();
     model.set_capture(true);
     for (const auto token : prompt) model.step(token);
     model.set_capture(false);
@@ -1431,6 +1499,7 @@ std::vector<std::int32_t> greedy_tokens(TextModel& model, const std::vector<std:
 std::vector<std::int32_t> dflash_tokens(TextModel& model, const Store& draft, const std::vector<std::int32_t>& prompt,
                                        int new_tokens, std::vector<std::int32_t>& proposals, int& accepted,
                                        std::string& finish, int& verify_rounds) {
+    model.prime_capture_kda();
     const DflashOutput output = generate_dflash_continuation(
         model, [&](std::int32_t anchor) { return propose_dflash(model, draft, anchor); }, prompt, new_tokens);
     proposals = output.last_proposals;
