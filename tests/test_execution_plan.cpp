@@ -1,6 +1,6 @@
 #include "ninfer_glm53/execution_plan.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 
 int main() {
     using namespace ninfer::glm53;
@@ -19,17 +19,17 @@ int main() {
     deployment.dflash_revision = "dc77ff1c99eeb2df044ee3d4f0094eb033fee410";
 
     const auto plan = build_tp2_execution_plan(model, deployment);
-    assert(plan.rank_geometry.world_size == 2U);
-    assert(plan.rank_geometry.hyper_connection_streams == 4U);
-    assert(plan.rank_geometry.local_attention_heads == 32U);
-    assert(plan.rank_geometry.local_kv_heads == 32U);
-    assert(plan.rank_geometry.local_index_heads == 16U);
-    assert(plan.rank_geometry.local_linear_attention_heads == 32U);
-    assert(plan.layers.size() == 45U);
-    assert(plan.layers[3].persistent_state == PersistentStateKind::kSparseMlaKvAndIndex);
-    assert(plan.layers[4].persistent_state == PersistentStateKind::kKdaRecurrent);
-    assert(plan.speculative.enabled);
-    assert(plan.speculative.proposal_tokens == 7U);
-    assert(validate_execution_plan(plan, model, deployment).errors.empty());
+    CHECK(plan.rank_geometry.world_size == 2U);
+    CHECK(plan.rank_geometry.hyper_connection_streams == 4U);
+    CHECK(plan.rank_geometry.local_attention_heads == 32U);
+    CHECK(plan.rank_geometry.local_kv_heads == 32U);
+    CHECK(plan.rank_geometry.local_index_heads == 16U);
+    CHECK(plan.rank_geometry.local_linear_attention_heads == 32U);
+    CHECK(plan.layers.size() == 45U);
+    CHECK(plan.layers[3].persistent_state == PersistentStateKind::kSparseMlaKvAndIndex);
+    CHECK(plan.layers[4].persistent_state == PersistentStateKind::kKdaRecurrent);
+    CHECK(plan.speculative.enabled);
+    CHECK(plan.speculative.proposal_tokens == 7U);
+    CHECK(validate_execution_plan(plan, model, deployment).errors.empty());
     return 0;
 }

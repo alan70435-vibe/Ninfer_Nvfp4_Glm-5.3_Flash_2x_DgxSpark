@@ -45,10 +45,10 @@ int main() {
     std::vector<std::uint8_t> packed32(16, 0x22);
     const std::uint8_t scales2[] = {0x38, 0x40};
     std::vector<float> wide(32);
-    nvfp4_dequantize(packed32.data(), scales2, 1.f, 1, 32, wide.data());
+    nvfp4_dequantize(packed32, scales2, 1.f, 1, 32, wide);
     expect(near(wide[0], 1.f) && near(wide[16], 2.f), "group of 16 selects the scale");
     std::vector<float> x32(32, 1.f);
-    nvfp4_gemv(x32.data(), wide.data(), 1, 32, y);
+    nvfp4_gemv(x32, wide, 1, 32, y);
     expect(near(y[0], 48.f), "two-group gemv");
     return 0;
 }

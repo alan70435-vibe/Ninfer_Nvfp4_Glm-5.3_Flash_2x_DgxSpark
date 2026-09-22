@@ -4,18 +4,53 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   contract-tests:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debug
+            build_type: Debug
+            sanitizers: 'OFF'
+          - name: Release
+            build_type: Release
+            sanitizers: 'OFF'
+          - name: Sanitizers
+            build_type: Debug
+            sanitizers: 'ON'
+    name: host-${{ matrix.name }}
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          uname -a
+          c++ --version
+          cmake --version
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_GLM53_BUILD_TESTS=ON
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DNINFER_GLM53_BUILD_TESTS=ON
+          -DNINFER_GLM53_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
       - name: Build
         run: cmake --build build --parallel 2
       - name: Test
-        run: ctest --test-dir build --output-on-failure
-      - name: Python syntax
+        run: ctest --test-dir build --output-on-failure --output-junit host-tests.xml
+      - name: Python syntax (not checkpoint behavior validation)
         run: python3 -m py_compile scripts/checkpoint_manifest.py
-      - name: Shell syntax
+      - name: Shell syntax (not hardware validation)
         run: bash -n scripts/preflight_dgxspark.sh
+      - name: Test log
+        if: always()
+        run: |
+          if [ -f build/Testing/Temporary/LastTest.log ]; then
+            cat build/Testing/Temporary/LastTest.log
+          fi
