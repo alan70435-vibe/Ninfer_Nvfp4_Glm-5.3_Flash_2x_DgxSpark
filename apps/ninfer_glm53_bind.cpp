@@ -69,6 +69,11 @@ int main(int argc, char** argv) {
         const auto receipt = ninfer::glm53::binding_receipt_json(report);
         if (output.empty()) {
             std::cout << receipt;
+            std::cout.flush();
+            if (!std::cout) {
+                std::cerr << "failed while writing receipt to stdout\n";
+                return 1;
+            }
         } else {
             if (output.has_parent_path()) std::filesystem::create_directories(output.parent_path());
             std::ofstream file(output);
@@ -77,6 +82,16 @@ int main(int argc, char** argv) {
                 return 1;
             }
             file << receipt;
+            file.flush();
+            if (!file) {
+                std::cerr << "failed while writing " << output << '\n';
+                return 1;
+            }
+            file.close();
+            if (!file) {
+                std::cerr << "failed while closing " << output << '\n';
+                return 1;
+            }
         }
         print_summary(report);
         return report.complete ? 0 : 2;

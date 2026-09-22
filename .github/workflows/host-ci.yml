@@ -44,8 +44,14 @@ jobs:
         run: cmake --build build --parallel 2
       - name: Test
         run: ctest --test-dir build --output-on-failure --output-junit host-tests.xml
-      - name: Python syntax (not checkpoint behavior validation)
-        run: python3 -m py_compile scripts/checkpoint_manifest.py
+      - name: Python syntax
+        run: python3 -m py_compile scripts/checkpoint_manifest.py tests/test_checkpoint_manifest.py tests/test_preflight.py tests/test_bind_cli.py
+      - name: Host utility behavior
+        if: matrix.name == 'Debug'
+        run: |
+          python3 tests/test_checkpoint_manifest.py
+          python3 tests/test_preflight.py
+          python3 tests/test_bind_cli.py
       - name: Shell syntax (not hardware validation)
         run: bash -n scripts/preflight_dgxspark.sh
       - name: Test log

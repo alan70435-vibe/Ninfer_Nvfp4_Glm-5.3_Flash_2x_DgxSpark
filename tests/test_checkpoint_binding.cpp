@@ -26,6 +26,17 @@ void expect_eq(std::size_t actual, std::size_t expected, const char* label) {
     }
 }
 
+template <class Fn>
+void expect_throws(Fn&& fn, const char* label) {
+    try {
+        fn();
+    } catch (const std::exception&) {
+        return;
+    }
+    std::cerr << label << " did not throw\n";
+    std::exit(1);
+}
+
 const ninfer::glm53::ExpectedTensor* find_logical(const std::vector<ninfer::glm53::ExpectedTensor>& catalog,
                                                   std::string_view logical_id) {
     for (const auto& tensor : catalog) {
@@ -208,6 +219,41 @@ int main() {
            "tiny weight");
     expect(loaded.tensors.at("tiny.mcg").has_mcg_value, "safetensors payload offset is readable");
 
+    write_safetensors(temp / "truncated.safetensors",
+                      R"({"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}})", "");
+    expect_throws([&] { (void)read_safetensors_file(temp / "truncated.safetensors", false); },
+                  "truncated payload");
+
+    write_safetensors(temp / "wrong-size.safetensors",
+                      R"({"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,2]}})", std::string_view(data, 2));
+    expect_throws([&] { (void)read_safetensors_file(temp / "wrong-size.safetensors", false); },
+                  "dtype/shape payload size mismatch");
+
+    const char overlap_data[] = {'a', 'b', 'c'};
+    write_safetensors(temp / "overlap.safetensors",
+                      R"({"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"b":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}})",
+                      std::string_view(overlap_data, sizeof(overlap_data)));
+    expect_throws([&] { (void)read_safetensors_file(temp / "overlap.safetensors", false); },
+                  "overlapping payloads");
+
+    std::string nested = R"({"__metadata__":{"audit":)";
+    nested.append(80, '[');
+    nested += "0";
+    nested.append(80, ']');
+    nested += R"(},"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}})";
+    write_safetensors(temp / "deep.safetensors", nested, std::string_view(data, 2));
+    expect_throws([&] { (void)read_safetensors_file(temp / "deep.safetensors", false); },
+                  "invalid/deep metadata rejected");
+
+    std::string deep_unknown = R"({"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2],"unknown":)";
+    deep_unknown.append(80, '[');
+    deep_unknown += "0";
+    deep_unknown.append(80, ']');
+    deep_unknown += "}}";
+    write_safetensors(temp / "deep-unknown.safetensors", deep_unknown, std::string_view(data, 2));
+    expect_throws([&] { (void)read_safetensors_file(temp / "deep-unknown.safetensors", false); },
+                  "excessive JSON nesting in unknown tensor field");
+
     const auto name_dir = temp / "names";
     std::filesystem::create_directories(name_dir);
     write_text(name_dir / "config.json", R"({
@@ -225,6 +271,16 @@ int main() {
     expect_eq(names.bound, 1U, "names bound");
     expect_eq(names.missing, target.size() - 1U, "names missing");
     expect(!names.complete && !names.shapes_checked && names.io_errors == 0, "names incomplete without io errors");
+
+    write_text(name_dir / "model.safetensors.index.json",
+               R"({"weight_map":{"lm_head.weight":"a.safetensors","lm_head.weight":"b.safetensors"}})");
+    const auto duplicate_index = bind_checkpoint_directory(name_dir, true);
+    expect(!duplicate_index.complete && duplicate_index.io_errors > 0, "duplicate weight_map key rejected");
+
+    write_text(name_dir / "model.safetensors.index.json",
+               R"({"weight_map":{"lm_head.weight":"../outside.safetensors"}})");
+    const auto unsafe_path = bind_checkpoint_directory(name_dir, true);
+    expect(!unsafe_path.complete && unsafe_path.io_errors > 0, "unsafe shard path rejected");
 
     std::filesystem::remove_all(temp);
     return 0;

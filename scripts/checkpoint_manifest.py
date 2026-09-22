@@ -62,6 +62,32 @@ INDEX_CANDIDATES = (
 )
 
 MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
+EXPECTED_TENSOR_COUNT = 148_498
+PRODUCT_QUANT_METHOD = "compressed-tensors"
+PRODUCT_WEIGHT_FORMAT = "nvfp4-pack-quantized"
+PRODUCT_CONFIG_SHA256 = "29c9f4171196910e99b9c069d6b76c56e3cdcd0f436dc1bacbc9513c9a7529ac"
+PRODUCT_INDEX_SHA256 = "015faae91e8189c7553f1d48ec3d0694b8c02b282d7f58af2d7b4064a81ce4c0"
+
+DTYPE_BYTES = {
+    "BOOL": 1,
+    "I8": 1,
+    "U8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E4M3FN": 1,
+    "F8_E4M3FNUZ": 1,
+    "F8_E5M2FNUZ": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
 
 
 def dig(data: Any, dotted: str) -> Any:
@@ -84,8 +110,65 @@ def sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def load_json_bytes(raw: bytes) -> Any:
+    return json.loads(raw, object_pairs_hook=reject_duplicate_pairs)
+
+
+def load_json_text(text: str) -> Any:
+    return json.loads(text, object_pairs_hook=reject_duplicate_pairs)
+
+
+def contains_key_value(node: Any, key: str, expected: Any) -> bool:
+    if isinstance(node, dict):
+        if node.get(key) == expected:
+            return True
+        return any(contains_key_value(value, key, expected) for value in node.values())
+    if isinstance(node, list):
+        return any(contains_key_value(value, key, expected) for value in node)
+    return False
+
+
+def validate_safetensors_tensor(name: str, metadata: Any, payload_bytes: int) -> tuple[int, int]:
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{name}: tensor metadata must be an object")
+    dtype = metadata.get("dtype")
+    shape = metadata.get("shape")
+    offsets = metadata.get("data_offsets")
+    if dtype not in DTYPE_BYTES:
+        raise ValueError(f"{name}: unsupported dtype {dtype!r}")
+    if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+        raise ValueError(f"{name}: shape must contain non-negative integers")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or any(type(value) is not int for value in offsets)
+        or offsets[0] < 0
+        or offsets[1] < offsets[0]
+    ):
+        raise ValueError(f"{name}: invalid data_offsets")
+    begin, end = offsets
+    elements = 1
+    for dim in shape:
+        elements *= dim
+    expected_bytes = elements * DTYPE_BYTES[dtype]
+    if end - begin != expected_bytes:
+        raise ValueError(f"{name}: payload size does not match dtype and shape")
+    if end > payload_bytes:
+        raise ValueError(f"{name}: data_offsets exceed shard payload")
+    return begin, end
+
+
 def read_safetensors_header(path: Path) -> dict[str, Any]:
-    """Read only the JSON header of a safetensors file."""
+    """Read and validate the JSON header and tensor payload ranges without loading payload bytes."""
     with path.open("rb") as f:
         raw_len = f.read(8)
         if len(raw_len) != 8:
@@ -96,9 +179,21 @@ def read_safetensors_header(path: Path) -> dict[str, Any]:
         raw_header = f.read(header_len)
         if len(raw_header) != header_len:
             raise ValueError("truncated safetensors JSON header")
-    header = json.loads(raw_header)
+    header = load_json_bytes(raw_header)
     if not isinstance(header, dict):
         raise ValueError("safetensors header must be a JSON object")
+    payload_bytes = path.stat().st_size - 8 - header_len
+    ranges: list[tuple[int, int, str]] = []
+    for name, metadata in header.items():
+        if name == "__metadata__":
+            continue
+        begin, end = validate_safetensors_tensor(name, metadata, payload_bytes)
+        if begin != end:
+            ranges.append((begin, end, name))
+    ranges.sort()
+    for previous, current in zip(ranges, ranges[1:]):
+        if current[0] < previous[1]:
+            raise ValueError(f"{current[2]}: payload overlaps {previous[2]}")
     return header
 
 
@@ -123,8 +218,13 @@ def main() -> int:
     if not config_path.is_file():
         parser.error(f"missing {config_path}")
 
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config_sha256 = sha256(config_path)
+    config = load_json_text(config_path.read_text(encoding="utf-8"))
     errors: list[str] = []
+    if config_sha256 != PRODUCT_CONFIG_SHA256:
+        errors.append(
+            f"config.json sha256 does not match pinned product checkpoint: {config_sha256}"
+        )
     warnings: list[str] = []
     observed: dict[str, Any] = {}
     for key, expected in EXPECTED.items():
@@ -132,6 +232,15 @@ def main() -> int:
         observed[key] = actual
         if actual != expected:
             errors.append(f"{key}: expected {expected!r}, got {actual!r}")
+
+    quantization_config = config.get("quantization_config") if isinstance(config, dict) else None
+    quant_method = dig(config, "quantization_config.quant_method")
+    if quant_method != PRODUCT_QUANT_METHOD:
+        errors.append(
+            f"quantization_config.quant_method: expected {PRODUCT_QUANT_METHOD!r}, got {quant_method!r}"
+        )
+    if not contains_key_value(quantization_config, "format", PRODUCT_WEIGHT_FORMAT):
+        errors.append(f"quantization_config must declare format {PRODUCT_WEIGHT_FORMAT!r}")
 
     expected_layer_types = [
         "deepseek_sparse_attention" if i >= 3 and (i - 3) % 4 == 0 else "linear_attention"
@@ -147,13 +256,26 @@ def main() -> int:
 
     index_path = next((root / name for name in INDEX_CANDIDATES if (root / name).is_file()), None)
     weight_map: dict[str, str] = {}
+    index_sha256 = sha256(index_path) if index_path else None
     if index_path:
-        index = json.loads(index_path.read_text(encoding="utf-8"))
+        if index_path.name != "model.safetensors.index.json":
+            errors.append("product checkpoint requires model.safetensors.index.json")
+        if index_sha256 != PRODUCT_INDEX_SHA256:
+            errors.append(
+                f"{index_path.name} sha256 does not match pinned product checkpoint: {index_sha256}"
+            )
+        index = load_json_text(index_path.read_text(encoding="utf-8"))
         raw_map = index.get("weight_map", {})
         if not isinstance(raw_map, dict):
             errors.append(f"{index_path.name}: weight_map is not an object")
         else:
             weight_map = {str(k): str(v) for k, v in raw_map.items()}
+            if len(weight_map) != EXPECTED_TENSOR_COUNT:
+                errors.append(
+                    f"{index_path.name}: expected {EXPECTED_TENSOR_COUNT} indexed tensors, got {len(weight_map)}"
+                )
+    else:
+        errors.append("product checkpoint requires a weight index")
 
     referenced_shards = sorted(set(weight_map.values()))
     if not referenced_shards:
@@ -220,7 +342,7 @@ def main() -> int:
     index_missing_from_headers: list[str] = []
     index_owner_mismatches: list[dict[str, str]] = []
     header_unindexed: list[str] = []
-    if weight_map and actual_tensor_records and not shard_header_errors:
+    if weight_map and not shard_header_errors:
         for tensor_name, expected_owner in weight_map.items():
             actual_owner = tensor_owner_from_headers.get(tensor_name)
             if actual_owner is None:
@@ -235,9 +357,14 @@ def main() -> int:
         if index_owner_mismatches:
             errors.append(f"{len(index_owner_mismatches)} indexed tensor(s) point at the wrong shard")
         if header_unindexed:
-            warnings.append(f"{len(header_unindexed)} header tensor(s) are not present in the weight_map")
+            errors.append(f"{len(header_unindexed)} header tensor(s) are not present in the weight_map")
 
-    tensor_names = sorted(actual_tensor_records or {name: {} for name in weight_map})
+    if not missing_shards and not shard_header_errors and len(actual_tensor_records) != EXPECTED_TENSOR_COUNT:
+        errors.append(
+            f"expected {EXPECTED_TENSOR_COUNT} tensors in shard headers, got {len(actual_tensor_records)}"
+        )
+
+    tensor_names = sorted(actual_tensor_records)
     prefixes: dict[str, int] = {}
     for name in tensor_names:
         prefix = name.split(".", 1)[0]
@@ -275,9 +402,9 @@ def main() -> int:
         "valid_checkpoint_contract": not errors,
         "errors": errors,
         "warnings": warnings,
-        "config_sha256": sha256(config_path),
+        "config_sha256": config_sha256,
         "index_file": index_path.name if index_path else None,
-        "index_sha256": sha256(index_path) if index_path else None,
+        "index_sha256": index_sha256,
         "expected_fields": EXPECTED,
         "observed_fields": observed,
         "tensor_count": len(tensor_names),
