@@ -18,7 +18,11 @@ int main(int argc, char** argv) {
     std::string mode = "greedy";
     std::string quant = "nvfp4";
     std::string draft_checkpoint;
+    std::string bind_host;
+    std::string peer_host;
     int new_tokens = 2;
+    int rank = -1;
+    int port = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto need = [&](std::string& dest) {
@@ -42,6 +46,18 @@ int main(int argc, char** argv) {
             std::string text;
             if (!need(text)) return 64;
             new_tokens = std::stoi(text);
+        } else if (arg == "--rank") {
+            std::string text;
+            if (!need(text)) return 64;
+            rank = std::stoi(text);
+        } else if (arg == "--bind") {
+            if (!need(bind_host)) return 64;
+        } else if (arg == "--peer") {
+            if (!need(peer_host)) return 64;
+        } else if (arg == "--port") {
+            std::string text;
+            if (!need(text)) return 64;
+            port = std::stoi(text);
         } else {
             std::cerr << "unknown argument " << arg << '\n';
             return 64;
@@ -75,7 +91,11 @@ int main(int argc, char** argv) {
 
     ninfer::glm53::GenerateResult result;
     try {
-        result = ninfer::glm53::generate_text(root, prompt_id, mode, new_tokens, draft_checkpoint);
+        if (rank >= 0) {
+            result = ninfer::glm53::generate_text_peer(root, prompt_id, new_tokens, rank, bind_host, peer_host, port);
+        } else {
+            result = ninfer::glm53::generate_text(root, prompt_id, mode, new_tokens, draft_checkpoint);
+        }
     } catch (const std::exception& error) {
         result.ok = false;
         result.reason = error.what();
@@ -114,6 +134,8 @@ int main(int argc, char** argv) {
     write_line(std::cout, "reference", "glm5_next_eager_fp32_modelopt_nvfp4");
     write_line(std::cout, "gpu", "NVIDIA GB10");
     write_line(std::cout, "world_size", std::to_string(result.world_size == 0 ? 1 : result.world_size));
-    write_line(std::cout, "second_spark", "not_used");
+    const std::string second_spark =
+        (bind_host == "192.168.100.11" || peer_host == "192.168.100.11") ? "192.168.100.11" : "not_used";
+    write_line(std::cout, "second_spark", second_spark);
     return result.ok ? 0 : 4;
 }

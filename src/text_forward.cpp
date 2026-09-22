@@ -18,6 +18,9 @@
 #include <iostream>
 #include <poll.h>
 #include <stdexcept>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1437,7 +1440,160 @@ std::vector<std::int32_t> dflash_tokens(TextModel& model, const Store& draft, co
     return output.tokens;
 }
 
+int open_peer_socket(int rank, std::string_view bind_host, std::string_view peer_host, int port) {
+    if ((rank != 0 && rank != 1) || port <= 0 || port > 65535) fail("rank link endpoint");
+    auto address = [](std::string_view host, int port_num) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<std::uint16_t>(port_num));
+        const std::string text(host);
+        if (::inet_pton(AF_INET, text.c_str(), &addr.sin_addr) != 1) fail("rank link address");
+        return addr;
+    };
+    const int buffer = 4 * 1024 * 1024;
+    auto enlarge = [&](int fd) {
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+        const int nodelay = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    };
+    if (rank == 0) {
+        const int server = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (server < 0) fail("rank link socket");
+        const int reuse = 1;
+        ::setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        const sockaddr_in local = address(bind_host, port);
+        if (::bind(server, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
+            ::close(server);
+            fail("rank link bind");
+        }
+        if (::listen(server, 1) != 0) {
+            ::close(server);
+            fail("rank link listen");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+        int accepted = -1;
+        while (accepted < 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ::close(server);
+                fail("rank link accept timeout");
+            }
+            pollfd ready{};
+            ready.fd = server;
+            ready.events = POLLIN;
+            const int polled = ::poll(&ready, 1, 1000);
+            if (polled < 0) {
+                if (errno == EINTR) continue;
+                ::close(server);
+                fail("rank link accept failed");
+            }
+            if (polled == 0) continue;
+            accepted = ::accept(server, nullptr, nullptr);
+            if (accepted < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                ::close(server);
+                fail("rank link accept failed");
+            }
+        }
+        ::close(server);
+        enlarge(accepted);
+        set_nonblock(accepted);
+        return accepted;
+    }
+    const sockaddr_in local = address(bind_host, 0);
+    const sockaddr_in remote = address(peer_host, port);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) fail("rank link socket");
+        if (::bind(fd, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
+            ::close(fd);
+            fail("rank link bind");
+        }
+        set_nonblock(fd);
+        const int connected = ::connect(fd, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+        if (connected != 0 && errno != EINPROGRESS) {
+            ::close(fd);
+            ::poll(nullptr, 0, 200);
+            continue;
+        }
+        if (connected != 0) {
+            pollfd ready{};
+            ready.fd = fd;
+            ready.events = POLLOUT;
+            const int polled = ::poll(&ready, 1, 1000);
+            int so_error = 0;
+            socklen_t length = sizeof(so_error);
+            ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &length);
+            if (polled <= 0 || so_error != 0) {
+                ::close(fd);
+                continue;
+            }
+        }
+        enlarge(fd);
+        return fd;
+    }
+    fail("rank link connect timeout");
+}
+
 }  // namespace
+
+GenerateResult generate_text_peer(const std::filesystem::path& checkpoint, std::string_view prompt_id, int new_tokens,
+                                  int rank, std::string_view bind_host, std::string_view peer_host, int port) {
+    GenerateResult result;
+    if (!fixed_prompt_tokens(prompt_id, result.prompt_text, result.prompt_tokens)) {
+        result.reason = "unknown_prompt";
+        return result;
+    }
+    if (new_tokens < 1 || new_tokens > 8) {
+        result.reason = "new_tokens_out_of_range";
+        return result;
+    }
+    SocketFd link(open_peer_socket(rank, bind_host, peer_host, port));
+    TextModel model(checkpoint, 1);
+    model.set_rank(rank, link.get());
+    const std::vector<std::int32_t> generated = greedy_tokens(model, result.prompt_tokens, new_tokens);
+    auto send_ids = [&](const std::vector<std::int32_t>& ids) {
+        const std::int32_t count = static_cast<std::int32_t>(ids.size());
+        send_all(link.get(), &count, sizeof(count));
+        if (count > 0) {
+            send_all(link.get(), ids.data(), static_cast<std::size_t>(count) * sizeof(std::int32_t));
+        }
+    };
+    auto recv_ids = [&]() {
+        std::int32_t count = 0;
+        recv_all(link.get(), &count, sizeof(count));
+        if (count < 0 || count > new_tokens) fail("peer token count");
+        std::vector<std::int32_t> ids(static_cast<std::size_t>(count));
+        if (count > 0) recv_all(link.get(), ids.data(), static_cast<std::size_t>(count) * sizeof(std::int32_t));
+        return ids;
+    };
+    std::vector<std::int32_t> other;
+    if (rank == 0) {
+        send_ids(generated);
+        other = recv_ids();
+    } else {
+        other = recv_ids();
+        send_ids(generated);
+    }
+    result.world_size = 2;
+    result.token_ids = generated;
+    result.committed = static_cast<std::uint32_t>(generated.size());
+    result.logit_margin = model.margin();
+    if (rank == 0) {
+        result.rank0_tokens = generated;
+        result.rank0_committed = result.committed;
+        result.rank1_tokens = std::move(other);
+        result.rank1_committed = static_cast<std::uint32_t>(result.rank1_tokens.size());
+    } else {
+        result.rank1_tokens = generated;
+        result.rank1_committed = result.committed;
+        result.rank0_tokens = std::move(other);
+        result.rank0_committed = static_cast<std::uint32_t>(result.rank0_tokens.size());
+    }
+    result.ok = result.rank0_tokens == result.rank1_tokens && !result.rank0_tokens.empty();
+    if (!result.ok) result.reason = "tp2_rank_mismatch";
+    return result;
+}
 
 GenerateResult generate_text(const std::filesystem::path& checkpoint, std::string_view prompt_id, std::string_view mode,
                              int new_tokens, const std::filesystem::path& draft_checkpoint) {

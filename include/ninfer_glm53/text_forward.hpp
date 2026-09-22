@@ -67,4 +67,10 @@ struct GenerateResult {
                                            std::string_view mode, int new_tokens,
                                            const std::filesystem::path& draft_checkpoint = {});
 
+// One rank of TP=2 on two machines. Rank 0 binds bind_host:port. Rank 1 binds
+// bind_host and connects to peer_host:port. GEMV row halves use that socket.
+[[nodiscard]] GenerateResult generate_text_peer(const std::filesystem::path& checkpoint, std::string_view prompt_id,
+                                                int new_tokens, int rank, std::string_view bind_host,
+                                                std::string_view peer_host, int port);
+
 }  // namespace ninfer::glm53
