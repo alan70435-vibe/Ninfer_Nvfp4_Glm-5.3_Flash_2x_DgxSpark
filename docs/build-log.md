@@ -97,6 +97,10 @@ The official snapshot `09b04e5e74bca08ca8549fc736d4cdd8624bfde3` is on disk (191
 
 The existing host build's CTest was 12/12, and `test_bind_cli.py`, `test_checkpoint_manifest.py`, and `test_preflight.py` passed. Dequant in `include/ninfer_glm53/nvfp4_decode.hpp` remains `e2m1 * fp8_e4m3(block_scale) * weight_scale_2`. That suite is not a GB10 continuation.
 
+## Short greedy on the worker, measured 2026-09-22T14:33:40+08:00
+
+`ninfer-glm53-generate` ran on `gx10-23ec` (NVIDIA GB10 12.1, `GPU-d5d58447-ec10-0155-e20a-cf12158797b9`) against `09b04e5e74bca08ca8549fc736d4cdd8624bfde3`. Prompt `13041`, greedy, `new_tokens=2`. Both repeats returned `token_ids=154822,154822`, `committed_length=2`, `world_size=1`. The first-token logits were `154822=20.1262` and `315=6.60393`. No independent NVFP4 continuation was recorded. Dequant remains `e2m1 * fp8_e4m3(block_scale) * weight_scale_2`.
+
 ## Still required on Blackwell
 
 SM121 NVFP4 GEMM that keeps packed bytes packed, BF16 projections, KDA, sparse
