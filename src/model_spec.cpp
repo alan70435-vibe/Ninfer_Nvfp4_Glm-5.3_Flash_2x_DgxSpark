@@ -99,6 +99,17 @@ std::vector<std::string> validate_model_spec(const ModelSpec& spec) {
         errors.emplace_back("architecture must be Glm5NextForConditionalGeneration");
     }
     if (spec.hidden_size != 4096U) errors.emplace_back("hidden_size must be 4096");
+    if (spec.intermediate_size != 12288U) errors.emplace_back("intermediate_size must be 12288");
+    if (spec.vocab_size != 154880U) errors.emplace_back("vocab_size must be 154880");
+    if (spec.qk_head_dim != 256U) errors.emplace_back("qk_head_dim must be 256");
+    if (spec.qk_nope_head_dim != 256U) errors.emplace_back("qk_nope_head_dim must be 256");
+    if (spec.v_head_dim != 256U) errors.emplace_back("v_head_dim must be 256");
+    if (spec.index_kpool != 4U) errors.emplace_back("index_kpool must be 4");
+    if (spec.linear_attention_heads != 64U) errors.emplace_back("linear_attention_heads must be 64");
+    if (spec.linear_attention_head_dim != 128U) errors.emplace_back("linear_attention_head_dim must be 128");
+    if (spec.short_conv_kernel_size != 4U) errors.emplace_back("short_conv_kernel_size must be 4");
+    if (spec.shared_experts != 1U) errors.emplace_back("shared_experts must be 1");
+    if (spec.moe_intermediate_size != 2048U) errors.emplace_back("moe_intermediate_size must be 2048");
     if (spec.layers.size() != ModelSpec::kLayerCount) errors.emplace_back("layer count must be 45");
     if (spec.max_position_embeddings != 1048576U) {
         errors.emplace_back("max_position_embeddings must be 1048576");

@@ -26,7 +26,7 @@ int main() {
     std::vector<std::uint8_t> scales(width, 0);
     scales[0] = 0x38;
     std::vector<float> weight(width * width);
-    nvfp4_dequantize(packed.data(), scales.data(), 1.f, width, width, weight.data());
+    nvfp4_dequantize(packed, scales, 1.f, width, width, weight);
 
     float x[width];
     float norm_w[width];

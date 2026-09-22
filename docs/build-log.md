@@ -67,10 +67,11 @@ CPU stack after the trellis fix. It does not agree with the dual-Spark EXL3
 vLLM result `13041,13041`. The EXL3 ids are not an NVFP4 measurement. Copying
 them here would be false.
 
-The host suite for this tree is `model_spec`, `deployment_contract`,
-`execution_plan`, `checkpoint_binding`, `nvfp4_decode`, `tiny_layer`,
-`speculative`, and `text_forward`. On 2026-09-22 that suite was 8/8 passed
-from a Release build on this GB10.
+The host suite is the contract tests, `nvfp4_decode`, `nvfp4_view`,
+`text_forward`, `speculative`, and `contract_regressions`. On 2026-09-22,
+after merging the remote host-hardening commit and keeping ModelOpt
+`weight_scale_2` as a multiply, that suite was 12/12 passed from a Release
+build on this GB10.
 
 ## Upstream looked at on 2026-09-22
 

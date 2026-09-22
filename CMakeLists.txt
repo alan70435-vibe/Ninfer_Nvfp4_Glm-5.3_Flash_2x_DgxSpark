@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NINFER_GLM53_BUILD_TESTS "Build host-side contract tests" ON)
+option(NINFER_GLM53_ENABLE_SANITIZERS "Instrument host code with ASan and UBSan" OFF)
 
 add_library(ninfer_glm53_core STATIC
     src/model_spec.cpp
@@ -36,6 +37,14 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(ninfer_glm53_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
+if(NINFER_GLM53_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "Host sanitizers require GCC or Clang")
+    endif()
+    target_compile_options(ninfer_glm53_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(ninfer_glm53_core INTERFACE -fsanitize=address,undefined)
+endif()
+
 add_executable(ninfer-glm53-plan apps/ninfer_glm53_plan.cpp)
 target_link_libraries(ninfer-glm53-plan PRIVATE ninfer_glm53_core)
 
@@ -49,9 +58,12 @@ if(NINFER_GLM53_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding nvfp4_decode tiny_layer speculative text_forward)
+    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding nvfp4_decode tiny_layer speculative text_forward contract_regressions nvfp4_view test_support)
         add_executable(test_${test_name} tests/test_${test_name}.cpp)
         target_link_libraries(test_${test_name} PRIVATE ninfer_glm53_core)
         add_test(NAME ${test_name} COMMAND test_${test_name})
     endforeach()
+    # CHECK must fail even in Release. A zero exit here is a failing CTest.
+    add_test(NAME test_support_rejects_false COMMAND test_test_support --fail)
+    set_tests_properties(test_support_rejects_false PROPERTIES WILL_FAIL TRUE)
 endif()

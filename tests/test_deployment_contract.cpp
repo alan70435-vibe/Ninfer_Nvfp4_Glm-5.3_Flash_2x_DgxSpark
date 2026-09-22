@@ -1,6 +1,6 @@
 #include "ninfer_glm53/deployment_contract.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
 
@@ -52,16 +52,16 @@ int main() {
     }
 
     const auto env = parse_env_file(path);
-    assert(env.at("TP") == "2");
+    CHECK(env.at("TP") == "2");
     const auto deployment = deployment_from_env(env);
     const auto report = validate_deployment_contract(deployment, glm53_flash_spec());
-    assert(report.errors.empty());
-    assert(report.warnings.empty());
+    CHECK(report.errors.empty());
+    CHECK(report.warnings.empty());
 
     auto invalid = deployment;
     invalid.tensor_parallel = 1;
     const auto invalid_report = validate_deployment_contract(invalid, glm53_flash_spec());
-    assert(!invalid_report.errors.empty());
+    CHECK(!invalid_report.errors.empty());
 
     std::filesystem::remove(path);
     return 0;

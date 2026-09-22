@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -43,13 +45,20 @@ int main() {
         expect(decoded == expected || (decoded == 0.f && expected == 0.f), "fp8 code");
     }
     float untouched = 7.f;
-    nvfp4_dequantize(nullptr, nullptr, 1.f, 1, 17, &untouched);
-    expect(untouched == 7.f, "illegal width does not write");
+    bool rejected = false;
+    try {
+        nvfp4_dequantize(std::span<const std::uint8_t>{}, std::span<const std::uint8_t>{}, 1.f, 1, 17,
+                         std::span<float>(&untouched, 1));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    expect(rejected && untouched == 7.f, "illegal width does not write");
 
     const std::uint8_t packed[] = {0x21, 0, 0, 0, 0, 0, 0, 0};
     const std::uint8_t scales[] = {0x38};
     float weight[16];
-    nvfp4_dequantize(packed, scales, 1.f, 1, 16, weight);
+    nvfp4_dequantize(std::span<const std::uint8_t>(packed, 8), std::span<const std::uint8_t>(scales, 1), 1.f, 1, 16,
+                     std::span<float>(weight, 16));
     expect(near(weight[0], 0.5f) && near(weight[1], 1.f), "low nibble then high nibble");
     for (int i = 2; i < 16; ++i) expect(weight[i] == 0.f, "remaining nibbles are zero");
 
@@ -57,20 +66,22 @@ int main() {
     x[0] = 1.f;
     x[1] = 1.f;
     float y[1];
-    nvfp4_gemv(x, weight, 1, 16, y);
+    nvfp4_gemv(std::span<const float>(x, 16), std::span<const float>(weight, 16), 1, 16, std::span<float>(y, 1));
     expect(near(y[0], 1.5f), "nvfp4 gemv");
 
-    nvfp4_dequantize(packed, scales, 2.f, 1, 16, weight);
-    nvfp4_gemv(x, weight, 1, 16, y);
+    nvfp4_dequantize(std::span<const std::uint8_t>(packed, 8), std::span<const std::uint8_t>(scales, 1), 2.f, 1, 16,
+                     std::span<float>(weight, 16));
+    nvfp4_gemv(std::span<const float>(x, 16), std::span<const float>(weight, 16), 1, 16, std::span<float>(y, 1));
     expect(near(y[0], 3.f), "weight_scale_2 multiplies the block scale");
 
     std::vector<std::uint8_t> packed32(16, 0x22);
     const std::uint8_t scales2[] = {0x38, 0x40};
     std::vector<float> wide(32);
-    nvfp4_dequantize(packed32.data(), scales2, 1.f, 1, 32, wide.data());
+    nvfp4_dequantize(std::span<const std::uint8_t>(packed32), std::span<const std::uint8_t>(scales2, 2), 1.f, 1, 32,
+                     std::span<float>(wide));
     expect(near(wide[0], 1.f) && near(wide[16], 2.f), "group of 16 selects the scale");
     std::vector<float> x32(32, 1.f);
-    nvfp4_gemv(x32.data(), wide.data(), 1, 32, y);
+    nvfp4_gemv(std::span<const float>(x32), std::span<const float>(wide), 1, 32, std::span<float>(y, 1));
     expect(near(y[0], 48.f), "two-group gemv");
     return 0;
 }
