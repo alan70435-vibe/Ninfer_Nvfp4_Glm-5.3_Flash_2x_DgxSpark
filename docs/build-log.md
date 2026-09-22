@@ -91,6 +91,12 @@ GB10. The same tree passed `test_checkpoint_manifest.py`,
   the EXL3 launcher and KV reservation. It does not publish this ModelOpt
   checkpoint or an NVFP4 kernel.
 
+## Launch refused, measured 2026-09-22T14:25:17+08:00
+
+The official snapshot `09b04e5e74bca08ca8549fc736d4cdd8624bfde3` is on disk (191G, `quant_method=modelopt`, `quant_algo=NVFP4`). Head `gx10-5749` had an active wayland session and MemAvailable 120881568 KiB. `glm53-nvfp4-head` was Exited. Worker `gx10-23ec` answered ping, with MemAvailable 6.1 GiB because `glm53-exl3-worker` (`VLLM::Worker_TP` pid 3737500) held 106226 MiB. `glm53-nvfp4-worker` stayed Exited. `ninfer-glm53-generate` was not started. No independent NVFP4 continuation was recorded, and no token ids were produced.
+
+The existing host build's CTest was 12/12, and `test_bind_cli.py`, `test_checkpoint_manifest.py`, and `test_preflight.py` passed. Dequant in `include/ninfer_glm53/nvfp4_decode.hpp` remains `e2m1 * fp8_e4m3(block_scale) * weight_scale_2`. That suite is not a GB10 continuation.
+
 ## Still required on Blackwell
 
 SM121 NVFP4 GEMM that keeps packed bytes packed, BF16 projections, KDA, sparse
