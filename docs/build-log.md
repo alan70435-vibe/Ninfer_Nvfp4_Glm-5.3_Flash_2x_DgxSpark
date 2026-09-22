@@ -107,3 +107,7 @@ SM121 NVFP4 GEMM that keeps packed bytes packed, BF16 projections, KDA, sparse
 MLA, the indexer, routed MoE, NCCL TP2 over the CX-7 link, fp8 KV, and a
 temperature-0 continuation from a Blackwell NVFP4 server. Placeholder kernels
 are not part of this record.
+
+## Host conv history, DFlash continuation, and local TP2 lifetime
+
+The in-place causal conv now keeps the raw channel for the history tail, so a Q/K/V alias no longer stores the SiLU output. DFlash restores the rejected candidate cache and continues until the budget or EOS. Store releases each mapped shard when a load fails, and the local TP2 path reaps its child with a 30-second deadline on each rank-link send or receive. CTest after that host fix was 12/12 passed. This does not create an NVFP4 external continuation and does not change multiplication by `weight_scale_2`.
