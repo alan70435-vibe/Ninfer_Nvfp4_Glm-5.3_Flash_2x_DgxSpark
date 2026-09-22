@@ -111,3 +111,5 @@ are not part of this record.
 ## Host conv history, DFlash continuation, and local TP2 lifetime
 
 The in-place causal conv now keeps the raw channel for the history tail, so a Q/K/V alias no longer stores the SiLU output. DFlash restores the rejected candidate cache and continues until the budget or EOS. Store releases each mapped shard when a load fails, and the local TP2 path reaps its child with a 30-second deadline on each rank-link send or receive. CTest after that host fix was 12/12 passed. This does not create an NVFP4 external continuation and does not change multiplication by `weight_scale_2`.
+
+On 2026-09-22T17:55+08:00 the EXL3 image's prefill `causal_conv1d_fn`, given a cache slot other than null block 0, matched `silu(x * weight[:, -1])` at cosine `1.00000024`. The NVFP4 host conv uses that same last-tap rule and was not edited. `weight_scale_2` is still multiplied into the packed GEMV. No NVFP4 greedy run was repeated, and there is still no independent NVFP4 continuation of prompt `13041`.
