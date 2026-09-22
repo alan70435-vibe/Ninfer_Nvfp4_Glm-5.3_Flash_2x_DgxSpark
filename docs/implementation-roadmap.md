@@ -9,7 +9,7 @@ This roadmap starts at NVFP4 storage. EXL3 kernel work stays in
 **Implemented**, carried over from the EXL3 line and retargeted:
 
 - 45-layer GLM-5.3-Flash `ModelSpec`;
-- two-node deployment contract pinned to compressed-tensors NVFP4;
+- two-node deployment contract pinned to official ModelOpt NVFP4;
 - TP2 execution plan with mHC all-reduce boundaries;
 - KDA versus sparse-MLA persistent state;
 - DFlash2 k=7 plan fields;
@@ -19,19 +19,19 @@ This roadmap starts at NVFP4 storage. EXL3 kernel work stays in
 
 **Implemented**
 
-- logical catalog for native tensors, layers 3–44 NVFP4 experts, layer 45 FP8
-  block experts, the vision tower, and the DFlash2 draft;
-- binder that refuses `quant_method: modelopt`;
-- shape formulas checked against the RedHat shard-1 and MTP headers;
-- name coverage of the published index: 148,498 / 148,498.
+- logical catalog for native tensors, ModelOpt NVFP4 on dense MLP layers 0–2
+  and routed experts in layers 3–44, BF16 MTP experts, the vision tower, and
+  the DFlash2 draft;
+- binder that requires `quant_method: modelopt` and `quant_algo: NVFP4`;
+- shapes checked against the local official shards.
 
-**Still open:** a shapes-checked receipt from a local copy of all weight
-shards. The index match was names-only because the shards are not downloaded.
+A CPU eager forward now emits token ids from this catalog. It does not yet
+match an external Blackwell continuation. See `docs/build-log.md`.
 
 ## P2 — packed views and memory plan
 
-1. Define the byte layout of `weight_packed` and the FP8 block scales, with a
-   slice round-trip against a known decoder.
+1. Define the byte layout of packed `.weight` and the FP8 block scales, with a
+   slice round-trip against the ModelOpt decoder.
 2. Keep packed bytes packed. Do not expand the resident expert weights to BF16.
 3. Account for two 121 GiB nodes: target, draft, graphs, KDA state, and the
    1M-token KV budget at fp8.

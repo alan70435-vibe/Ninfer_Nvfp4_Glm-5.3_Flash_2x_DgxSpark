@@ -1,34 +1,32 @@
 # NInfer × GLM-5.3-Flash NVFP4 × 2 DGX Spark
 
-A purpose-built inference runtime for **GLM-5.3-Flash compressed-tensors NVFP4**
+A purpose-built inference runtime for **GLM-5.3-Flash official ModelOpt NVFP4**
 on exactly **2 × NVIDIA DGX Spark / GB10**, using tensor parallelism over the
 ConnectX-7 200 Gb/s RoCE link.
 
 The model contract, TP2 execution plan and DFlash2 protocol come from
 [Ninfer_Exl3_Glm-5.3_Flash_2x_DgxSpark](https://github.com/alan70435/Ninfer_Exl3_Glm-5.3_Flash_2x_DgxSpark).
-That repository stops at EXL3 checkpoint binding. This repository is the
-runtime line: GB10's 4-bit path is NVFP4, so the kernels will be written
-against this checkpoint instead of the EXL3 trellis.
+That repository keeps the EXL3 trellis line. This repository is the NVFP4
+line: GB10 Blackwell's 4-bit tensor-core path is NVFP4, so those kernels
+will be written against this checkpoint. The construction record is
+[`docs/build-log.md`](docs/build-log.md).
 
 ## Status
 
-Host contracts and the NVFP4 storage catalog are in place. CUDA kernels, NCCL
-and the serving API are not.
+Host contracts, the ModelOpt storage catalog, and a CPU eager text forward are in place.
+`ninfer-glm53-generate` reads the local checkpoint and emits greedy token ids.
+CUDA kernels, NCCL and the serving API are not.
 
-The product checkpoint is `RedHatAI/GLM-5.3-Flash-NVFP4` at
-`18d55bfd5a2194887738da73753975c9d3842f46`:
+The product checkpoint is `nvidia/GLM-5.3-Flash-NVFP4` at
+`09b04e5e74bca08ca8549fc736d4cdd8624bfde3`:
 
-- layers 3–44 routed experts: NVFP4 packed weights, FP8 block scales, FP32 global scales;
-- layer 45 routed experts: FP8 E4M3 weights with BF16 128×128 block scales;
-- attention, dense FFN, router, shared experts, embeddings, `lm_head` and vision: native BF16/FP32.
+- dense MLP layers 0–2 and routed experts in layers 3–44: ModelOpt NVFP4
+  (`.weight`, `.weight_scale`, `.weight_scale_2`, `.input_scale`);
+- layer 45 routed experts: BF16 `.weight` only;
+- attention, router, shared experts, embeddings, `lm_head` and vision: native BF16/FP32.
 
-Name coverage of that index is 148,498 / 148,498. Storage shapes were checked
-against the shard-1 and `model_mtp.safetensors` headers. The weight shards
-themselves are not in this repository. See
-[`docs/nvfp4-binding.md`](docs/nvfp4-binding.md).
-
-ModelOpt NVFP4 checkpoints are refused. They use different tensor suffixes and
-have emitted corrupted token ids under vLLM.
+The logical catalog is 147,661 tensors. See
+[`docs/nvfp4-binding.md`](docs/nvfp4-binding.md). Compressed-tensors exports are refused.
 
 ## Build
 
@@ -38,7 +36,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 
 ./build/ninfer-glm53-plan configs/dgxspark_tp2.env.example
-./build/ninfer-glm53-bind /path/to/RedHatAI-GLM-5.3-Flash-NVFP4 -o receipt.json
+./build/ninfer-glm53-bind /path/to/GLM-5.3-Flash-NVFP4 -o receipt.json
 ```
 
 `--names-only` checks the index without opening shards. A complete receipt
@@ -53,4 +51,6 @@ Architecture verification for this runtime is:
 3. DFlash2 at k=7 and temperature 0 matches target-only generation, including partial acceptance.
 
 Those gates are still open. The order is in
-[`docs/implementation-roadmap.md`](docs/implementation-roadmap.md).
+[`docs/implementation-roadmap.md`](docs/implementation-roadmap.md). What has
+already been built, and what the CPU forward did not match, is in
+[`docs/build-log.md`](docs/build-log.md).

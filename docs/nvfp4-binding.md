@@ -1,50 +1,26 @@
 # NVFP4 checkpoint binding
 
-The product checkpoint is `RedHatAI/GLM-5.3-Flash-NVFP4` revision
-`18d55bfd5a2194887738da73753975c9d3842f46`. `quant_method` is
-`compressed-tensors`. Routed experts in layers 3–44 use
-`nvfp4-pack-quantized`. Layer 45 routed experts use FP8 block quantization.
-The saved tensor names are the released GLM namespace (`hc_attn_*`,
-`self_attn.f_a_proj`, `self_attn.A_log`), including tensors stored in
-`model_mtp.safetensors`.
+The product checkpoint is official `nvidia/GLM-5.3-Flash-NVFP4` revision
+`09b04e5e74bca08ca8549fc736d4cdd8624bfde3`. `quant_method` is `modelopt` and
+`quant_algo` is `NVFP4` (ModelOpt `0.47.0.dev393`). Compressed-tensors exports
+are rejected.
 
 ## Measured storage
-
-Shapes below were read from the safetensors headers of
-`model-00001-of-00010.safetensors` and `model_mtp.safetensors`. Inside shard 1,
-every normalized tensor family has one dtype and shape except `o_proj`, which
-is `[4096, 8192]` on KDA layers and `[4096, 16384]` on sparse MLA layers.
 
 A logical linear of shape `[N, K]` (out, in) is stored as:
 
 | Region | Tensors | Dtype and shape |
 |---|---|---|
-| Layers 3–44 routed `gate`/`up` | `weight_packed`, `weight_scale`, `weight_global_scale`, `input_global_scale` | U8 `[N, K/2]`, F8_E4M3 `[N, K/16]`, F32 `[1]`, F32 `[1]` |
-| Layers 3–44 routed `down` | same four suffixes | `N=4096`, `K=2048` |
-| Layer 45 routed experts | `weight`, `weight_scale` | F8_E4M3 `[N, K]`, BF16 `[N/128, K/128]` |
-| Everything else | native `.weight` / auxiliary tensors | BF16 or FP32, same geometry as the EXL3 catalog |
+| Dense MLP layers 0–2 and routed experts in layers 3–44 | `.weight`, `.weight_scale`, `.weight_scale_2`, `.input_scale` | U8 `[N, K/2]`, F8_E4M3 `[N, K/16]`, F32 `[]`, F32 `[]` |
+| Layer 45 routed experts | `.weight` only | BF16 `[N, K]` |
+| Attention, router, shared experts, embeddings, `lm_head`, vision | native `.weight` and auxiliaries | BF16 or FP32 |
 
-Gate and up use `N=2048`, `K=4096`. Example from layer 3, expert 0:
-`weight_packed` is U8 `[2048, 2048]` and `weight_scale` is F8_E4M3 `[2048, 256]`.
-Layer 45 expert 0 gate is F8_E4M3 `[2048, 4096]` with BF16 scale `[16, 32]`.
+Gate and up use `N=2048`, `K=4096` on experts and `N=12288`, `K=4096` on the dense MLP. Down swaps those dimensions. The low nibble of each packed byte is the even K element. Reconstruction is `e2m1 * fp8_e4m3(weight_scale) * weight_scale_2`. `input_scale` is the activation scale and is not applied to the weight.
 
-The index contains 148,498 tensors: 1,618 native, 145,152 NVFP4 storage
-tensors, and 1,728 FP8-block tensors. A names-only bind of revision
-`18d55bfd5a2194887738da73753975c9d3842f46` matched every name:
-config sha256 `29c9f4171196910e99b9c069d6b76c56e3cdcd0f436dc1bacbc9513c9a7529ac`,
-index sha256 `015faae91e8189c7553f1d48ec3d0694b8c02b282d7f58af2d7b4064a81ce4c0`.
-The logical catalog sha256 is
-`674ff493a2911b72d94ddda1eaedc742b6895a0b1235d39656b765516e1971e8`.
-The receipt is [`receipts/redhat-nvfp4-names.json`](receipts/redhat-nvfp4-names.json).
-It records `shapes_checked: false` because the weight shards were not opened.
+The catalog has 147,661 tensors: 2,473 native (213 of them FP32) and 145,188 NVFP4 storage tensors. There is no FP8-block expert group. On this export, KDA `q`/`k`/`v` convolutions are FP32 and every mHC tensor, including base and scale, is BF16. Logical catalog sha256 is `9df33d5e4a73bcd41237a3d9c2c69ec9c1b2e78087f2bcbb4ef2fb5660136d30`. The local snapshot is `/home/max_aibbox/models/GLM-5.3-Flash-NVFP4`, the same files as Hugging Face snapshot `09b04e5e74bca08ca8549fc736d4cdd8624bfde3`. The shapes-checked receipt is [`receipts/nvidia-glm53-flash-nvfp4.json`](receipts/nvidia-glm53-flash-nvfp4.json).
 
-DFlash2 stays the separate BF16 draft
-`incoai/GLM-5.3-Flash-DFlash2` @ `dc77ff1c99eeb2df044ee3d4f0094eb033fee410`,
-81 tensors, unchanged from the EXL3 line.
+DFlash2 stays the separate BF16 draft `incoai/GLM-5.3-Flash-DFlash2` @ `dc77ff1c99eeb2df044ee3d4f0094eb033fee410`, 81 tensors, catalog sha256 `ccad9b633dc4090c50c6d1667778402cc634eb08bd7d87ac22e2abe209626b44`.
 
 ## What this does not prove
 
-Header shapes do not decode FP4 values and do not show that a GEMM matches
-BF16. The full weight shards were not loaded. ModelOpt exports
-(`weight`, `weight_scale`, `weight_scale_2`, `input_scale`, with scalar
-scales) are a different container and are rejected by the binder.
+A shapes-checked bind does not show that a full 45-layer forward matches a BF16 reference. Packed decode is tested on a CPU fixture against the ModelOpt formula above.

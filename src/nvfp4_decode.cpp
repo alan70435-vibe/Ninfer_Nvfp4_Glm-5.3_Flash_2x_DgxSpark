@@ -1,5 +1,8 @@
 #include "ninfer_glm53/nvfp4_decode.hpp"
 
+#include <cmath>
+#include <limits>
+
 namespace ninfer::glm53 {
 namespace {
 
@@ -16,20 +19,22 @@ float fp8_e4m3_to_f32(std::uint8_t bits) {
     const int sign = (bits >> 7) & 1;
     const int exp = (bits >> 3) & 0xf;
     const int mant = bits & 0x7;
-    float value = 0.f;
+    float magnitude = 0.f;
     if (exp == 0) {
-        value = static_cast<float>(mant) / 8.f * 0.015625f;  // 2^-6
+        magnitude = std::ldexp(static_cast<float>(mant), -9);
     } else if (exp == 15 && mant == 7) {
-        value = 0.f;  // NaN is not a weight scale
+        magnitude = std::numeric_limits<float>::quiet_NaN();
     } else {
-        value = (1.f + static_cast<float>(mant) / 8.f) * static_cast<float>(1 << (exp - 7));
+        magnitude = std::ldexp(1.f + static_cast<float>(mant) / 8.f, exp - 7);
     }
-    return sign != 0 ? -value : value;
+    return std::copysign(magnitude, sign != 0 ? -1.f : 1.f);
 }
 
 void nvfp4_dequantize(const std::uint8_t* packed, const std::uint8_t* scales, float global_scale, int rows,
                       int cols, float* weight) {
-    const float global = global_scale == 0.f ? 1.f : global_scale;
+    if (packed == nullptr || scales == nullptr || weight == nullptr || rows <= 0 || cols <= 0 || cols % 16 != 0) {
+        return;
+    }
     const int packed_cols = cols / 2;
     const int scale_cols = cols / 16;
     for (int row = 0; row < rows; ++row) {
@@ -40,13 +45,14 @@ void nvfp4_dequantize(const std::uint8_t* packed, const std::uint8_t* scales, fl
             const std::uint8_t byte = packed_row[col / 2];
             const std::uint8_t nibble = (col % 2 == 0) ? static_cast<std::uint8_t>(byte & 0x0fu)
                                                        : static_cast<std::uint8_t>(byte >> 4);
-            const float scale = fp8_e4m3_to_f32(scale_row[col / 16]) / global;
+            const float scale = fp8_e4m3_to_f32(scale_row[col / 16]) * global_scale;
             out[col] = e2m1(nibble) * scale;
         }
     }
 }
 
 void nvfp4_gemv(const float* x, const float* weight, int rows, int cols, float* y) {
+    if (x == nullptr || weight == nullptr || y == nullptr || rows <= 0 || cols <= 0) return;
     for (int row = 0; row < rows; ++row) {
         float sum = 0.f;
         const float* w = weight + row * cols;

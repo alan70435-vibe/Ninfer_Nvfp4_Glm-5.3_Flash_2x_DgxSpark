@@ -10,7 +10,7 @@
 
 namespace ninfer::glm53 {
 
-// Safetensors dtype names used by the compressed-tensors NVFP4 checkpoint and the DFlash2 draft.
+// Safetensors dtype names used by the official ModelOpt NVFP4 checkpoint and the DFlash2 draft.
 enum class DType : std::uint8_t {
     kBf16,
     kF16,
@@ -32,7 +32,8 @@ enum class StorageClass : std::uint8_t {
 };
 
 // NVFP4 packs two FP4 values per byte and scales every 16 input elements.
-// Layer-45 experts use a separate FP8 block layout, measured at 128.
+// weight_scale_2 and input_scale are rank-0 FP32. kFp8BlockSize remains for
+// any FP8-block tensor a caller still describes; the official checkpoint has none.
 inline constexpr std::uint32_t kNvfp4GroupSize = 16U;
 inline constexpr std::uint32_t kFp8BlockSize = 128U;
 

@@ -83,7 +83,7 @@ int main() {
     const auto draft = expected_dflash2_tensors();
     expect(validate_parameter_catalog(target).empty(), "target catalog");
     expect(validate_parameter_catalog(draft).empty(), "draft catalog");
-    expect_eq(target.size(), 148498U, "target tensors");
+    expect_eq(target.size(), 147661U, "target tensors");
     expect_eq(draft.size(), 81U, "draft tensors");
 
     std::size_t native = 0;
@@ -99,10 +99,10 @@ int main() {
         }
         if (tensor.storage == StorageClass::kNativeF32) ++f32;
     }
-    expect_eq(native, 1618U, "native tensors");
-    expect_eq(nvfp4, 145152U, "nvfp4 tensors");
-    expect_eq(fp8_block, 1728U, "fp8 block tensors");
-    expect_eq(f32, 291U, "fp32 tensors");
+    expect_eq(native, 2473U, "native tensors");
+    expect_eq(nvfp4, 145188U, "nvfp4 tensors");
+    expect_eq(fp8_block, 0U, "fp8 block tensors");
+    expect_eq(f32, 213U, "fp32 tensors");
 
     const auto* kda_q = find_logical(target, "language.layer.0.kda.q_proj");
     const auto* kda_log = find_logical(target, "language.layer.0.kda.a_log");
@@ -110,48 +110,57 @@ int main() {
     expect(kda_q != nullptr && kda_q->source_name == "model.language_model.layers.0.self_attn.q_proj.weight",
            "kda q source");
     expect(kda_q->dtype == DType::kBf16 && kda_q->shape == std::vector<std::int64_t>({8192, 4096}), "kda q shape");
+    const auto* kda_conv = find_logical(target, "language.layer.0.kda.q_conv");
+    const auto* mhc_base = find_logical(target, "language.layer.0.mhc.attn.base");
     expect(kda_log != nullptr && kda_log->dtype == DType::kF32 && kda_log->shape == std::vector<std::int64_t>({64}),
            "kda a_log");
+    expect(kda_conv != nullptr && kda_conv->dtype == DType::kF32 &&
+               kda_conv->shape == std::vector<std::int64_t>({8192, 1, 4}),
+           "kda conv is fp32");
+    expect(mhc_base != nullptr && mhc_base->dtype == DType::kBf16 && mhc_base->shape == std::vector<std::int64_t>({24}),
+           "mhc base is bf16");
     expect(no_mla == nullptr, "layer 0 is not sparse mla");
 
     const auto* mla_q = find_logical(target, "language.layer.3.mla.q_b_proj");
-    const auto* packed = find_logical(target, "language.layer.3.moe.expert.0.gate.packed");
+    const auto* packed = find_logical(target, "language.layer.3.moe.expert.0.gate.weight");
     const auto* scale = find_logical(target, "language.layer.3.moe.expert.0.gate.weight_scale");
-    const auto* global_scale = find_logical(target, "language.layer.3.moe.expert.0.gate.weight_global_scale");
-    const auto* dense = find_logical(target, "language.layer.0.ffn.gate_proj");
+    const auto* global_scale = find_logical(target, "language.layer.3.moe.expert.0.gate.weight_scale_2");
+    const auto* input_scale = find_logical(target, "language.layer.3.moe.expert.0.gate.input_scale");
+    const auto* dense = find_logical(target, "language.layer.0.ffn.gate_proj.weight");
     const auto* kda_on_mla = find_logical(target, "language.layer.3.kda.a_log");
     const auto* o_mla = find_logical(target, "language.layer.3.mixer.o_proj");
     const auto* o_kda = find_logical(target, "language.layer.44.mixer.o_proj");
     expect(mla_q != nullptr && mla_q->shape == std::vector<std::int64_t>({16384, 1536}), "mla q_b");
     expect(packed != nullptr && packed->dtype == DType::kU8 && packed->shape == std::vector<std::int64_t>({2048, 2048}) &&
-               packed->source_name == "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_packed",
+               packed->source_name == "model.language_model.layers.3.mlp.experts.0.gate_proj.weight",
            "nvfp4 packed");
     expect(scale != nullptr && scale->dtype == DType::kF8E4M3 && scale->shape == std::vector<std::int64_t>({2048, 256}),
            "nvfp4 scale");
-    expect(global_scale != nullptr && global_scale->dtype == DType::kF32 &&
-               global_scale->shape == std::vector<std::int64_t>({1}),
-           "nvfp4 global scale");
-    expect(dense != nullptr && dense->dtype == DType::kBf16 && dense->shape == std::vector<std::int64_t>({12288, 4096}),
-           "dense ffn stays bf16");
+    expect(global_scale != nullptr && global_scale->dtype == DType::kF32 && global_scale->shape.empty() &&
+               global_scale->source_name == "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_scale_2",
+           "nvfp4 weight_scale_2");
+    expect(input_scale != nullptr && input_scale->dtype == DType::kF32 && input_scale->shape.empty(),
+           "nvfp4 input_scale");
+    expect(dense != nullptr && dense->dtype == DType::kU8 && dense->shape == std::vector<std::int64_t>({12288, 2048}),
+           "dense ffn is nvfp4");
     expect(kda_on_mla == nullptr, "sparse layer has no kda parameters");
     expect(o_mla != nullptr && o_mla->shape == std::vector<std::int64_t>({4096, 16384}), "mla o_proj");
     expect(o_kda != nullptr && o_kda->shape == std::vector<std::int64_t>({4096, 8192}), "kda o_proj");
 
     const auto* nextn = find_logical(target, "language.nextn.eh_proj");
     const auto* nextn_mhc = find_logical(target, "language.nextn.mhc.attn.base");
-    const auto* nextn_expert = find_logical(target, "language.nextn.moe.expert.0.gate.weight");
+    const auto* nextn_expert = find_logical(target, "language.nextn.moe.expert.0.gate");
     const auto* nextn_scale = find_logical(target, "language.nextn.moe.expert.0.gate.weight_scale");
-    const auto* nextn_packed = find_logical(target, "language.nextn.moe.expert.0.gate.packed");
+    const auto* nextn_packed = find_logical(target, "language.nextn.moe.expert.0.gate.weight");
     expect(nextn != nullptr && nextn->source_name == "model.language_model.layers.45.eh_proj.weight" &&
                nextn->shape == std::vector<std::int64_t>({4096, 8192}),
            "nextn eh_proj");
     expect(nextn_mhc == nullptr, "nextn has no mhc");
-    expect(nextn_expert != nullptr && nextn_expert->dtype == DType::kF8E4M3 &&
-               nextn_expert->shape == std::vector<std::int64_t>({2048, 4096}),
-           "nextn expert fp8");
-    expect(nextn_scale != nullptr && nextn_scale->dtype == DType::kBf16 &&
-               nextn_scale->shape == std::vector<std::int64_t>({16, 32}),
-           "nextn expert fp8 scale");
+    expect(nextn_expert != nullptr && nextn_expert->dtype == DType::kBf16 &&
+               nextn_expert->shape == std::vector<std::int64_t>({2048, 4096}) &&
+               nextn_expert->source_name == "model.language_model.layers.45.mlp.experts.0.gate_proj.weight",
+           "nextn expert bf16");
+    expect(nextn_scale == nullptr, "nextn experts have no nvfp4 scale");
     expect(nextn_packed == nullptr, "nextn experts are not nvfp4 packed");
 
     const auto* qkv = find_logical(target, "vision.block.0.attn.qkv");
@@ -169,7 +178,7 @@ int main() {
 
     const std::string target_hash = logical_catalog_sha256(target);
     const std::string draft_hash = logical_catalog_sha256(draft);
-    constexpr std::string_view kTargetHash = "674ff493a2911b72d94ddda1eaedc742b6895a0b1235d39656b765516e1971e8";
+    constexpr std::string_view kTargetHash = "9df33d5e4a73bcd41237a3d9c2c69ec9c1b2e78087f2bcbb4ef2fb5660136d30";
     constexpr std::string_view kDraftHash = "ccad9b633dc4090c50c6d1667778402cc634eb08bd7d87ac22e2abe209626b44";
     if (target_hash != kTargetHash || draft_hash != kDraftHash) {
         std::cerr << "target catalog " << target_hash << '\n' << "draft catalog " << draft_hash << '\n';
@@ -212,7 +221,7 @@ int main() {
     std::filesystem::create_directories(name_dir);
     write_text(name_dir / "config.json", R"({
   "architectures": ["Glm5NextForConditionalGeneration"],
-  "quantization_config": {"quant_method": "compressed-tensors", "config_groups": {"group_0": {"format": "nvfp4-pack-quantized"}}},
+  "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
   "text_config": {"num_hidden_layers": 45, "n_routed_experts": 288, "num_nextn_predict_layers": 1},
   "vision_config": {"depth": 24}
 })");

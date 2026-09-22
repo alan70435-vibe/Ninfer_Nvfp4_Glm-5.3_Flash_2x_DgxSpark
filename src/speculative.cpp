@@ -32,7 +32,7 @@ SpecResult commit_dflash2(const std::int32_t* draft, std::uint32_t k, const std:
         accepted[count++] = target[0];
     } else {
         for (std::uint32_t i = 0; i < matched; ++i) accepted[count++] = draft[i];
-        if (matched == k) accepted[count++] = target[k];
+        accepted[count++] = target[matched];
     }
     const CommitView view{accepted, count};
     result.ranks_agree = commit_same_tokens(view, view, rank0, rank1);

@@ -47,8 +47,9 @@ void add_f32(std::vector<ExpectedTensor>& out,
     add(out, logical_id, source_name, DType::kF32, StorageClass::kNativeF32, shape, false);
 }
 
-// Compressed-tensors NVFP4 linear. Sibling BF16 linears are stored [N, K] = [out, in].
-// Packed bytes are [N, K/2], block scales are [N, K/16], and both global scales are F32[1].
+// Official ModelOpt NVFP4 linear. Logical [N, K] is stored as packed U8 [N, K/2]
+// (low nibble is the even K element), FP8 E4M3 block scales [N, K/16], and two
+// rank-0 FP32 scales. Reconstruction is e2m1 * fp8_scale * weight_scale_2.
 void add_nvfp4(std::vector<ExpectedTensor>& out,
                const std::string& logical_prefix,
                const std::string& source_prefix,
@@ -57,31 +58,15 @@ void add_nvfp4(std::vector<ExpectedTensor>& out,
     if (out_features <= 0 || in_features <= 0 || in_features % static_cast<std::int64_t>(kNvfp4GroupSize) != 0) {
         throw std::logic_error("NVFP4 input features must be a positive multiple of the group size");
     }
-    add(out, logical_prefix + ".packed", source_prefix + ".weight_packed", DType::kU8, StorageClass::kNvfp4PackedU8,
+    add(out, logical_prefix + ".weight", source_prefix + ".weight", DType::kU8, StorageClass::kNvfp4PackedU8,
         {out_features, in_features / 2}, false);
     add(out, logical_prefix + ".weight_scale", source_prefix + ".weight_scale", DType::kF8E4M3,
         StorageClass::kNvfp4BlockScaleF8, {out_features, in_features / static_cast<std::int64_t>(kNvfp4GroupSize)},
         false);
-    add(out, logical_prefix + ".weight_global_scale", source_prefix + ".weight_global_scale", DType::kF32,
-        StorageClass::kNvfp4GlobalScaleF32, {1}, false);
-    add(out, logical_prefix + ".input_global_scale", source_prefix + ".input_global_scale", DType::kF32,
-        StorageClass::kNvfp4GlobalScaleF32, {1}, false);
-}
-
-// Layer-45 routed experts are FP8 E4M3 weights with BF16 128x128 block scales.
-void add_fp8_block(std::vector<ExpectedTensor>& out,
-                   const std::string& logical_prefix,
-                   const std::string& source_prefix,
-                   std::int64_t out_features,
-                   std::int64_t in_features) {
-    const auto block = static_cast<std::int64_t>(kFp8BlockSize);
-    if (out_features <= 0 || in_features <= 0 || out_features % block != 0 || in_features % block != 0) {
-        throw std::logic_error("FP8 block linear features must be positive multiples of 128");
-    }
-    add(out, logical_prefix + ".weight", source_prefix + ".weight", DType::kF8E4M3, StorageClass::kFp8BlockWeight,
-        {out_features, in_features}, false);
-    add(out, logical_prefix + ".weight_scale", source_prefix + ".weight_scale", DType::kBf16,
-        StorageClass::kFp8BlockScaleBf16, {out_features / block, in_features / block}, false);
+    add(out, logical_prefix + ".weight_scale_2", source_prefix + ".weight_scale_2", DType::kF32,
+        StorageClass::kNvfp4GlobalScaleF32, {}, false);
+    add(out, logical_prefix + ".input_scale", source_prefix + ".input_scale", DType::kF32,
+        StorageClass::kNvfp4GlobalScaleF32, {}, false);
 }
 
 void add_moe(std::vector<ExpectedTensor>& out, const ModelSpec& model, const std::string& logical,
@@ -100,9 +85,10 @@ void add_moe(std::vector<ExpectedTensor>& out, const ModelSpec& model, const std
         const std::string expert_source = source + "mlp.experts." + std::to_string(expert) + ".";
         const std::string expert_logical = logical + "moe.expert." + std::to_string(expert) + ".";
         if (nextn) {
-            add_fp8_block(out, expert_logical + "gate", expert_source + "gate_proj", moe, hidden);
-            add_fp8_block(out, expert_logical + "up", expert_source + "up_proj", moe, hidden);
-            add_fp8_block(out, expert_logical + "down", expert_source + "down_proj", hidden, moe);
+            // Official ModelOpt leaves the MTP experts in BF16. There is no scale tensor.
+            add_bf16(out, expert_logical + "gate", expert_source + "gate_proj.weight", {moe, hidden});
+            add_bf16(out, expert_logical + "up", expert_source + "up_proj.weight", {moe, hidden});
+            add_bf16(out, expert_logical + "down", expert_source + "down_proj.weight", {hidden, moe});
         } else {
             add_nvfp4(out, expert_logical + "gate", expert_source + "gate_proj", moe, hidden);
             add_nvfp4(out, expert_logical + "up", expert_source + "up_proj", moe, hidden);
@@ -128,9 +114,10 @@ void add_kda(std::vector<ExpectedTensor>& out, const ModelSpec& model, const std
     add_bf16(out, logical + "kda.q_proj", source + "self_attn.q_proj.weight", {width, hidden});
     add_bf16(out, logical + "kda.k_proj", source + "self_attn.k_proj.weight", {width, hidden});
     add_bf16(out, logical + "kda.v_proj", source + "self_attn.v_proj.weight", {width, hidden});
-    add_bf16(out, logical + "kda.q_conv", source + "self_attn.q_conv1d.weight", {width, 1, kernel});
-    add_bf16(out, logical + "kda.k_conv", source + "self_attn.k_conv1d.weight", {width, 1, kernel});
-    add_bf16(out, logical + "kda.v_conv", source + "self_attn.v_conv1d.weight", {width, 1, kernel});
+    // Official ModelOpt export stores the short convolutions as FP32.
+    add_f32(out, logical + "kda.q_conv", source + "self_attn.q_conv1d.weight", {width, 1, kernel});
+    add_f32(out, logical + "kda.k_conv", source + "self_attn.k_conv1d.weight", {width, 1, kernel});
+    add_f32(out, logical + "kda.v_conv", source + "self_attn.v_conv1d.weight", {width, 1, kernel});
     add_bf16(out, logical + "kda.o_norm", source + "self_attn.o_norm.weight", {head_dim});
 }
 
@@ -166,19 +153,19 @@ void add_sparse_mla(std::vector<ExpectedTensor>& out, const ModelSpec& model, co
 
 void add_mhc(std::vector<ExpectedTensor>& out, const ModelSpec& model, const std::string& logical,
              const std::string& source) {
-    // Released GLM-5.3-Flash mHC parameters, measured on every decoder layer:
-    // base has streams*(streams+2) fp32 coefficients, scale has streams-1,
-    // and fn maps the concatenated streams (hidden*streams) into that width.
+    // Official ModelOpt export stores every mHC tensor, including base and scale, as BF16.
+    // base has streams*(streams+2) coefficients, scale has streams-1, and fn maps
+    // the concatenated streams (hidden*streams) into that width.
     const auto streams = model.hyper_connection_streams;
     const auto coeff = as_dim(streams * (streams + 2U));
     const auto scale = as_dim(streams - 1U);
     const auto fn_in = mul_dim(model.hidden_size, streams);
-    add_f32(out, logical + "mhc.attn.base", source + "hc_attn_base", {coeff});
+    add_bf16(out, logical + "mhc.attn.base", source + "hc_attn_base", {coeff});
     add_bf16(out, logical + "mhc.attn.fn", source + "hc_attn_fn", {coeff, fn_in});
-    add_f32(out, logical + "mhc.attn.scale", source + "hc_attn_scale", {scale});
-    add_f32(out, logical + "mhc.ffn.base", source + "hc_ffn_base", {coeff});
+    add_bf16(out, logical + "mhc.attn.scale", source + "hc_attn_scale", {scale});
+    add_bf16(out, logical + "mhc.ffn.base", source + "hc_ffn_base", {coeff});
     add_bf16(out, logical + "mhc.ffn.fn", source + "hc_ffn_fn", {coeff, fn_in});
-    add_f32(out, logical + "mhc.ffn.scale", source + "hc_ffn_scale", {scale});
+    add_bf16(out, logical + "mhc.ffn.scale", source + "hc_ffn_scale", {scale});
 }
 
 void add_language_layer(std::vector<ExpectedTensor>& out, const ModelSpec& model, std::uint32_t index,
@@ -200,9 +187,9 @@ void add_language_layer(std::vector<ExpectedTensor>& out, const ModelSpec& model
 
     if (ffn == FfnKind::kDense) {
         const auto intermediate = as_dim(model.intermediate_size);
-        add_bf16(out, logical + "ffn.gate_proj", source + "mlp.gate_proj.weight", {intermediate, hidden});
-        add_bf16(out, logical + "ffn.up_proj", source + "mlp.up_proj.weight", {intermediate, hidden});
-        add_bf16(out, logical + "ffn.down_proj", source + "mlp.down_proj.weight", {hidden, intermediate});
+        add_nvfp4(out, logical + "ffn.gate_proj", source + "mlp.gate_proj", intermediate, hidden);
+        add_nvfp4(out, logical + "ffn.up_proj", source + "mlp.up_proj", intermediate, hidden);
+        add_nvfp4(out, logical + "ffn.down_proj", source + "mlp.down_proj", hidden, intermediate);
     } else {
         add_moe(out, model, logical, source, nextn);
     }
@@ -449,7 +436,10 @@ std::vector<std::string> validate_parameter_catalog(const std::vector<ExpectedTe
         if (!source_names.insert(tensor.source_name).second) {
             errors.push_back("duplicate source name " + tensor.source_name);
         }
-        if (tensor.shape.empty()) errors.push_back("missing shape for " + tensor.logical_id);
+        const bool per_tensor_scale = tensor.storage == StorageClass::kNvfp4GlobalScaleF32;
+        if (!per_tensor_scale && tensor.shape.empty()) {
+            errors.push_back("missing shape for " + tensor.logical_id);
+        }
         for (const auto dim : tensor.shape) {
             if (dim <= 0) errors.push_back("non-positive shape for " + tensor.logical_id);
         }
@@ -471,8 +461,8 @@ std::vector<std::string> validate_parameter_catalog(const std::vector<ExpectedTe
             errors.push_back("NVFP4 block scale must be F8_E4M3[N, K/16] for " + tensor.logical_id);
         }
         if (tensor.storage == StorageClass::kNvfp4GlobalScaleF32 &&
-            (tensor.dtype != DType::kF32 || tensor.shape.size() != 1U || tensor.shape[0] != 1)) {
-            errors.push_back("NVFP4 global scale must be F32[1] for " + tensor.logical_id);
+            (tensor.dtype != DType::kF32 || !tensor.shape.empty())) {
+            errors.push_back("NVFP4 per-tensor scale must be rank-0 F32 for " + tensor.logical_id);
         }
         if (tensor.storage == StorageClass::kFp8BlockWeight &&
             (tensor.dtype != DType::kF8E4M3 || tensor.shape.size() != 2U)) {

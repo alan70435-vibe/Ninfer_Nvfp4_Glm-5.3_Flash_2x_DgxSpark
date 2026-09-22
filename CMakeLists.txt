@@ -17,6 +17,7 @@ add_library(ninfer_glm53_core STATIC
     src/nvfp4_decode.cpp
     src/tiny_layer.cpp
     src/speculative.cpp
+    src/text_forward.cpp
 )
 
 target_include_directories(ninfer_glm53_core
@@ -28,6 +29,11 @@ target_compile_features(ninfer_glm53_core PUBLIC cxx_std_20)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ninfer_glm53_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(ninfer_glm53_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 add_executable(ninfer-glm53-plan apps/ninfer_glm53_plan.cpp)
@@ -43,7 +49,7 @@ if(NINFER_GLM53_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding nvfp4_decode tiny_layer speculative)
+    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding nvfp4_decode tiny_layer speculative text_forward)
         add_executable(test_${test_name} tests/test_${test_name}.cpp)
         target_link_libraries(test_${test_name} PRIVATE ninfer_glm53_core)
         add_test(NAME ${test_name} COMMAND test_${test_name})

@@ -2,10 +2,10 @@
 
 ## Product target
 
-This repository serves GLM-5.3-Flash compressed-tensors NVFP4 on exactly two
+This repository serves GLM-5.3-Flash official ModelOpt NVFP4 on exactly two
 NVIDIA DGX Spark / GB10 nodes with TP=2. The product checkpoint is
-`RedHatAI/GLM-5.3-Flash-NVFP4`. Do not retarget the hot path to EXL3 or to a
-ModelOpt NVFP4 export.
+`nvidia/GLM-5.3-Flash-NVFP4` @ `09b04e5e74bca08ca8549fc736d4cdd8624bfde3`.
+Do not retarget the hot path to EXL3 or to a compressed-tensors export.
 
 The mathematical model contract is shared with
 `Ninfer_Exl3_Glm-5.3_Flash_2x_DgxSpark`. Quantized storage is not shared.
@@ -23,8 +23,9 @@ The mathematical model contract is shared with
 ## Checkpoint rules
 
 A binder fails when a required tensor is missing, duplicated, or has the wrong
-dtype or shape. `quant_method: modelopt` is a hard error. Layer 45 routed
-experts are FP8 block storage, not NVFP4.
+dtype or shape. `quant_method` must be `modelopt` with `quant_algo` NVFP4.
+Dense MLP layers 0–2 and routed experts in layers 3–44 are NVFP4. Layer 45
+routed experts are BF16 weights with no scale tensor.
 
 ## GPU implementation rules
 

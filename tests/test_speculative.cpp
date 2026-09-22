@@ -33,9 +33,10 @@ int main() {
     const std::int32_t draft[7] = {10, 11, 12, 13, 14, 15, 16};
     const std::int32_t partial[8] = {10, 11, 12, 99, 14, 15, 16, 77};
     auto partial_result = commit_dflash2(draft, kDflashProposals, partial, &rank0, &rank1);
-    expect(partial_result.ranks_agree && partial_result.committed == 3, "partial accept length");
-    expect(rank0.committed == 3 && rank1.committed == 3, "partial length on both ranks");
-    expect(partial_result.tokens[0] == 10 && partial_result.tokens[2] == 12, "partial tokens");
+    expect(partial_result.ranks_agree && partial_result.committed == 4, "partial accept keeps the correction");
+    expect(rank0.committed == 4 && rank1.committed == 4, "partial length on both ranks");
+    expect(partial_result.tokens[0] == 10 && partial_result.tokens[2] == 12 && partial_result.tokens[3] == 99,
+           "partial tokens");
 
     const std::int32_t full_target[8] = {10, 11, 12, 13, 14, 15, 16, 42};
     auto full = commit_dflash2(draft, kDflashProposals, full_target, &rank0, &rank1);

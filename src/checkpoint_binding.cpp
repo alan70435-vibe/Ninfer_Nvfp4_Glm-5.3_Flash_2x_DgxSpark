@@ -222,14 +222,14 @@ void check_config(BindingReport& report, CheckpointKind kind, std::string_view j
             add_error(report, "config architecture must be Glm5NextForConditionalGeneration");
         }
         const auto method = json_scan::find_string(json, "quant_method");
-        if (method && *method == "modelopt") {
+        if (method && *method == "compressed-tensors") {
             ++report.io_errors;
-            add_error(report, "ModelOpt NVFP4 is not the product checkpoint; use compressed-tensors RedHatAI/GLM-5.3-Flash-NVFP4");
+            add_error(report, "compressed-tensors NVFP4 is not the product checkpoint; use official nvidia/GLM-5.3-Flash-NVFP4");
         }
-        require_string(report, json, "quant_method", "compressed-tensors");
-        if (json.find("nvfp4-pack-quantized") == std::string_view::npos) {
+        require_string(report, json, "quant_method", "modelopt");
+        if (json.find("quant_algo") == std::string_view::npos || json.find("NVFP4") == std::string_view::npos) {
             ++report.io_errors;
-            add_error(report, "config must declare nvfp4-pack-quantized expert weights");
+            add_error(report, "config must declare quant_algo NVFP4");
         }
         require_int(report, json, "num_hidden_layers", 45);
         require_int(report, json, "n_routed_experts", 288);

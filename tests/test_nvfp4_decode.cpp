@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -23,6 +24,27 @@ int main() {
     using namespace ninfer::glm53;
     expect(near(e2m1(0x1), 0.5f) && near(e2m1(0x2), 1.f) && near(e2m1(0x9), -0.5f), "e2m1 table");
     expect(near(fp8_e4m3_to_f32(0x38), 1.f) && near(fp8_e4m3_to_f32(0x40), 2.f), "fp8 e4m3 anchors");
+    expect(near(fp8_e4m3_to_f32(0x08), 0.015625f), "fp8 smallest normal");
+    expect(near(fp8_e4m3_to_f32(0x30), 0.5f), "fp8 half");
+    expect(std::isnan(fp8_e4m3_to_f32(0x7f)) && std::isnan(fp8_e4m3_to_f32(0xff)), "fp8 nan stays nan");
+    expect(fp8_e4m3_to_f32(0x80) == 0.f && std::signbit(fp8_e4m3_to_f32(0x80)), "fp8 negative zero");
+    for (int code = 0; code < 256; ++code) {
+        const auto bits = static_cast<std::uint8_t>(code);
+        const int exp = (bits >> 3) & 0xf;
+        const int mant = bits & 0x7;
+        const float decoded = fp8_e4m3_to_f32(bits);
+        if (exp == 15 && mant == 7) {
+            expect(std::isnan(decoded), "every nan encoding");
+            continue;
+        }
+        const float magnitude = exp == 0 ? std::ldexp(static_cast<float>(mant), -9)
+                                         : std::ldexp(1.f + static_cast<float>(mant) / 8.f, exp - 7);
+        const float expected = (bits & 0x80u) != 0u ? -magnitude : magnitude;
+        expect(decoded == expected || (decoded == 0.f && expected == 0.f), "fp8 code");
+    }
+    float untouched = 7.f;
+    nvfp4_dequantize(nullptr, nullptr, 1.f, 1, 17, &untouched);
+    expect(untouched == 7.f, "illegal width does not write");
 
     const std::uint8_t packed[] = {0x21, 0, 0, 0, 0, 0, 0, 0};
     const std::uint8_t scales[] = {0x38};
@@ -40,7 +62,7 @@ int main() {
 
     nvfp4_dequantize(packed, scales, 2.f, 1, 16, weight);
     nvfp4_gemv(x, weight, 1, 16, y);
-    expect(near(y[0], 0.75f), "global scale divides the block scale");
+    expect(near(y[0], 3.f), "weight_scale_2 multiplies the block scale");
 
     std::vector<std::uint8_t> packed32(16, 0x22);
     const std::uint8_t scales2[] = {0x38, 0x40};
