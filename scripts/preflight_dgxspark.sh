@@ -81,32 +81,40 @@ else
 fi
 
 if command -v ip >/dev/null 2>&1; then
-  if ip -brief addr show "$net_if" >/tmp/ninfer_glm53_ip.$$ 2>/dev/null; then
-    net_line=$(cat /tmp/ninfer_glm53_ip.$$)
-    rm -f /tmp/ninfer_glm53_ip.$$
-    if [[ "$net_line" == *"$expected_ip/"* ]]; then
+  if net_line=$(ip -brief addr show "$net_if" 2>/dev/null); then
+    owns_expected_ip=0
+    for field in $net_line; do
+      if [[ "$field" == */* && "${field%%/*}" == "$expected_ip" ]]; then
+        owns_expected_ip=1
+        break
+      fi
+    done
+    if (( owns_expected_ip )); then
       ok "$net_if owns $expected_ip"
     else
       fail "$net_if does not own expected IP $expected_ip ($net_line)"
     fi
   else
-    rm -f /tmp/ninfer_glm53_ip.$$
     fail "interface $net_if does not exist"
   fi
 fi
 
 if command -v ethtool >/dev/null 2>&1 && [[ -e "/sys/class/net/$net_if" ]]; then
-  speed=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}')
-  link=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Link detected:/{print $2; exit}')
-  if [[ "$speed" == "200000Mb/s" ]]; then
-    ok "$net_if speed=$speed"
+  if ethtool_output=$(ethtool "$net_if" 2>/dev/null); then
+    speed=$(awk -F': ' '/Speed:/{print $2; exit}' <<<"$ethtool_output")
+    link=$(awk -F': ' '/Link detected:/{print $2; exit}' <<<"$ethtool_output")
+    if [[ "$speed" == "200000Mb/s" ]]; then
+      ok "$net_if speed=$speed"
+    else
+      fail "$net_if expected 200000Mb/s, got ${speed:-unknown}"
+    fi
+    if [[ "$link" == "yes" ]]; then
+      ok "$net_if link detected"
+    else
+      fail "$net_if link is ${link:-unknown}"
+    fi
   else
-    fail "$net_if expected 200000Mb/s, got ${speed:-unknown}"
-  fi
-  if [[ "$link" == "yes" ]]; then
-    ok "$net_if link detected"
-  else
-    fail "$net_if link is ${link:-unknown}"
+    fail "ethtool failed for $net_if"
   fi
 fi
 

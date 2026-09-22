@@ -154,8 +154,11 @@ public:
     }
 
 private:
+    static constexpr std::size_t kMaxNestingDepth = 64;
+
     std::string_view in_;
     std::size_t i_;
+    std::size_t depth_{0};
 
     [[noreturn]] void fail(const char* message) const {
         throw std::runtime_error(std::string("json: ") + message + " at offset " + std::to_string(i_));
@@ -201,11 +204,20 @@ private:
         }
     }
 
+    void enter_container() {
+        if (depth_ >= kMaxNestingDepth) fail("maximum nesting depth exceeded");
+        ++depth_;
+    }
+
+    void leave_container() noexcept { --depth_; }
+
     void skip_object() {
+        enter_container();
         expect('{');
         skip_ws();
         if (peek() == '}') {
             ++i_;
+            leave_container();
             return;
         }
         while (true) {
@@ -219,6 +231,7 @@ private:
             }
             if (ch == '}') {
                 ++i_;
+                leave_container();
                 return;
             }
             fail("expected ',' or '}'");
@@ -226,10 +239,12 @@ private:
     }
 
     void skip_array() {
+        enter_container();
         expect('[');
         skip_ws();
         if (peek() == ']') {
             ++i_;
+            leave_container();
             return;
         }
         while (true) {
@@ -241,6 +256,7 @@ private:
             }
             if (ch == ']') {
                 ++i_;
+                leave_container();
                 return;
             }
             fail("expected ',' or ']'");

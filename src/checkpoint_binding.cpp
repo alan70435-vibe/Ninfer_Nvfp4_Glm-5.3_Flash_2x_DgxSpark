@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -83,6 +84,62 @@ struct ParsedTensor {
     std::int64_t data_end{-1};
 };
 
+std::uint64_t dtype_size_bytes(std::string_view dtype) {
+    if (dtype == "BOOL" || dtype == "I8" || dtype == "U8" || dtype == "F8_E4M3" ||
+        dtype == "F8_E5M2" || dtype == "F8_E4M3FN" || dtype == "F8_E4M3FNUZ" ||
+        dtype == "F8_E5M2FNUZ") {
+        return 1U;
+    }
+    if (dtype == "I16" || dtype == "U16" || dtype == "F16" || dtype == "BF16") return 2U;
+    if (dtype == "I32" || dtype == "U32" || dtype == "F32") return 4U;
+    if (dtype == "I64" || dtype == "U64" || dtype == "F64") return 8U;
+    throw std::runtime_error("unsupported safetensors dtype: " + std::string(dtype));
+}
+
+std::uint64_t expected_tensor_bytes(const ParsedTensor& tensor) {
+    if (tensor.observed.dtype.empty()) {
+        throw std::runtime_error("tensor " + tensor.name + " is missing dtype");
+    }
+    std::uint64_t elements = 1U;
+    for (const auto dim : tensor.observed.shape) {
+        if (dim < 0) throw std::runtime_error("tensor " + tensor.name + " has a negative shape dimension");
+        const auto udim = static_cast<std::uint64_t>(dim);
+        if (udim != 0U && elements > std::numeric_limits<std::uint64_t>::max() / udim) {
+            throw std::runtime_error("tensor " + tensor.name + " shape size overflows uint64");
+        }
+        elements *= udim;
+    }
+    const auto width = dtype_size_bytes(tensor.observed.dtype);
+    if (elements != 0U && width > std::numeric_limits<std::uint64_t>::max() / elements) {
+        throw std::runtime_error("tensor " + tensor.name + " byte size overflows uint64");
+    }
+    return elements * width;
+}
+
+void validate_tensor_offsets(const ParsedTensor& tensor, std::uint64_t payload_bytes) {
+    if (tensor.data_begin < 0 || tensor.data_end < tensor.data_begin) {
+        throw std::runtime_error("tensor " + tensor.name + " has invalid data_offsets");
+    }
+    const auto begin = static_cast<std::uint64_t>(tensor.data_begin);
+    const auto end = static_cast<std::uint64_t>(tensor.data_end);
+    const auto expected = expected_tensor_bytes(tensor);
+    if (end - begin != expected) {
+        throw std::runtime_error("tensor " + tensor.name + " payload size does not match dtype and shape");
+    }
+    if (end > payload_bytes) {
+        throw std::runtime_error("tensor " + tensor.name + " data_offsets exceed shard payload");
+    }
+}
+
+bool safe_relative_shard_name(std::string_view shard) {
+    const std::filesystem::path path{std::string(shard)};
+    if (path.empty() || path.is_absolute() || path.has_root_name() || path.has_root_directory()) return false;
+    for (const auto& component : path) {
+        if (component == "..") return false;
+    }
+    return path.lexically_normal() != std::filesystem::path{"."};
+}
+
 void parse_tensor_object(json_scan::Cursor& cursor, ParsedTensor& parsed) {
     cursor.expect('{');
     if (cursor.peek() == '}') {
@@ -126,6 +183,26 @@ void parse_tensor_object(json_scan::Cursor& cursor, ParsedTensor& parsed) {
     }
 }
 
+void parse_safetensors_metadata(json_scan::Cursor& cursor) {
+    cursor.expect('{');
+    if (cursor.peek() == '}') {
+        cursor.expect('}');
+        return;
+    }
+    while (true) {
+        (void)cursor.parse_string();
+        cursor.expect(':');
+        (void)cursor.parse_string();
+        const char next = cursor.peek();
+        if (next == ',') {
+            cursor.expect(',');
+            continue;
+        }
+        cursor.expect('}');
+        return;
+    }
+}
+
 std::vector<ParsedTensor> parse_safetensors_header(std::string_view header) {
     json_scan::Cursor cursor(header);
     cursor.expect('{');
@@ -135,7 +212,7 @@ std::vector<ParsedTensor> parse_safetensors_header(std::string_view header) {
         const auto key = cursor.parse_string();
         cursor.expect(':');
         if (key == "__metadata__") {
-            cursor.skip_value();
+            parse_safetensors_metadata(cursor);
         } else {
             ParsedTensor parsed;
             parsed.name = key;
@@ -169,7 +246,8 @@ std::unordered_map<std::string, std::string> parse_weight_map(std::string_view j
                     auto name = cursor.parse_string();
                     cursor.expect(':');
                     auto shard = cursor.parse_string();
-                    weight_map.emplace(std::move(name), std::move(shard));
+                    const auto [_, inserted] = weight_map.emplace(name, shard);
+                    if (!inserted) throw std::runtime_error("duplicate tensor in weight_map: " + name);
                     const char next = cursor.peek();
                     if (next == ',') {
                         cursor.expect(',');
@@ -318,7 +396,26 @@ TensorCatalog read_shard(const std::filesystem::path& path, const std::string& s
         throw std::runtime_error("truncated safetensors header in " + shard_name);
     }
     const auto data_start = 8U + header_len;
+    const auto file_bytes = static_cast<std::uint64_t>(std::filesystem::file_size(path));
+    if (file_bytes < data_start) throw std::runtime_error("truncated safetensors payload in " + shard_name);
+    const auto payload_bytes = file_bytes - data_start;
     auto parsed = parse_safetensors_header(header);
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(parsed.size());
+    for (const auto& tensor : parsed) {
+        validate_tensor_offsets(tensor, payload_bytes);
+        const auto begin = static_cast<std::uint64_t>(tensor.data_begin);
+        const auto end = static_cast<std::uint64_t>(tensor.data_end);
+        if (begin != end) ranges.emplace_back(begin, end);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (std::size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first < ranges[i - 1U].second) {
+            throw std::runtime_error("overlapping tensor payload ranges in " + shard_name);
+        }
+    }
+
     TensorCatalog catalog;
     catalog.tensors.reserve(parsed.size());
     for (auto& tensor : parsed) {
@@ -521,7 +618,12 @@ BindingReport bind_checkpoint_directory(const std::filesystem::path& directory, 
     }
 
     for (const auto& shard : shard_names) {
-        const auto path = root / shard;
+        if (!safe_relative_shard_name(shard)) {
+            ++report.io_errors;
+            add_error(report, "unsafe shard path in weight_map: " + shard);
+            continue;
+        }
+        const auto path = root / std::filesystem::path(shard);
         if (!std::filesystem::is_regular_file(path)) {
             if (!names_only) {
                 ++report.io_errors;
@@ -545,7 +647,8 @@ BindingReport bind_checkpoint_directory(const std::filesystem::path& directory, 
         }
     } else if (report.io_errors == 0 || !shard_names.empty()) {
         for (const auto& shard : shard_names) {
-            const auto path = root / shard;
+            if (!safe_relative_shard_name(shard)) continue;
+            const auto path = root / std::filesystem::path(shard);
             if (!std::filesystem::is_regular_file(path)) continue;
             TensorCatalog shard_catalog;
             try {
