@@ -56,6 +56,13 @@ zero. NaN scales stay NaN. `K` must be a positive multiple of 16.
 5. `ninfer-glm53-generate` runs the same CPU eager text stack as the EXL3
    line, with NVFP4 experts and NVFP4 dense MLP layers 0–2. Local TP2 and
    DFlash2 k=7 fork two processes on one machine.
+6. While that forward was being recorded, `origin/main` gained `5ec9d09`
+   (validated packed views) and `af001e0` (checkpoint admission, read-only
+   preflight, receipt I/O). Both were merged. The packed view still
+   multiplies by ModelOpt `weight_scale_2`. A global scale that is
+   non-finite, not positive, or subnormal is rejected. Receipt errors print
+   `path.string()`, because streaming a `std::filesystem::path` adds quotes
+   and hid the `/dev/full` failure from `tests/test_bind_cli.py`.
 
 ## Experiments
 
@@ -69,9 +76,11 @@ them here would be false.
 
 The host suite is the contract tests, `nvfp4_decode`, `nvfp4_view`,
 `text_forward`, `speculative`, and `contract_regressions`. On 2026-09-22,
-after merging the remote host-hardening commit and keeping ModelOpt
-`weight_scale_2` as a multiply, that suite was 12/12 passed from a Release
-build on this GB10.
+after merging the remote host-hardening commits, keeping ModelOpt
+`weight_scale_2` as a multiply, and printing receipt paths with
+`path.string()`, that suite was 12/12 passed from a Release build on this
+GB10. The same tree passed `test_checkpoint_manifest.py`,
+`test_preflight.py`, and `test_bind_cli.py`.
 
 ## Upstream looked at on 2026-09-22
 

@@ -78,18 +78,18 @@ int main(int argc, char** argv) {
             if (output.has_parent_path()) std::filesystem::create_directories(output.parent_path());
             std::ofstream file(output);
             if (!file) {
-                std::cerr << "cannot write " << output << '\n';
+                std::cerr << "cannot write " << output.string() << '\n';
                 return 1;
             }
             file << receipt;
             file.flush();
             if (!file) {
-                std::cerr << "failed while writing " << output << '\n';
+                std::cerr << "failed while writing " << output.string() << '\n';
                 return 1;
             }
             file.close();
             if (!file) {
-                std::cerr << "failed while closing " << output << '\n';
+                std::cerr << "failed while closing " << output.string() << '\n';
                 return 1;
             }
         }
