@@ -94,6 +94,17 @@ std::uint16_t f32_to_bf16(float value) {
     return static_cast<std::uint16_t>(bits >> 16);
 }
 
+// The dense MLP kernel stores SiLU, then the product, as bf16. An fp32
+// product makes the following NVFP4 down projection miss the captured FFN.
+void swiglu_clamp_bf16(const float* gate, const float* up, int n, float limit, float* hidden) {
+    for (int i = 0; i < n; ++i) {
+        const float capped_gate = bf16_to_f32(f32_to_bf16(std::min(gate[i], limit)));
+        const float capped_up = bf16_to_f32(f32_to_bf16(std::min(limit, std::max(-limit, up[i]))));
+        const float activated = bf16_to_f32(f32_to_bf16(silu(capped_gate)));
+        hidden[i] = bf16_to_f32(f32_to_bf16(activated * capped_up));
+    }
+}
+
 constexpr std::chrono::seconds kRankIoBudget{30};
 
 [[nodiscard]] bool wait_fd(int fd, int events, std::chrono::steady_clock::time_point deadline) {
@@ -510,8 +521,9 @@ float cast_to_e2m1(float value) {
     return sign * snapped;
 }
 
-// ModelOpt W4A4. global_scale is 1/input_scale. Each 16-wide group is quantized
-// and restored before the weight dot, matching the FP4 GEMM reference.
+// ModelOpt W4A4. global_scale is 1/input_scale. The vector keeps e2m1 times
+// the fp8 block scale. input_scale is applied once with weight_scale_2 after
+// the dot, which is the CUTLASS alpha.
 void quant_dequant_nvfp4_activation(const float* x, int cols, float input_scale, float* y) {
     if (!(input_scale > 0.f) || !std::isfinite(input_scale) || cols % 16 != 0) fail("NVFP4 input scale");
     const float global_scale = 1.f / input_scale;
@@ -532,15 +544,16 @@ void quant_dequant_nvfp4_activation(const float* x, int cols, float input_scale,
             float clipped = rounded[lane] * output_scale;
             if (clipped > 6.f) clipped = 6.f;
             if (clipped < -6.f) clipped = -6.f;
-            y[group * 16 + lane] = cast_to_e2m1(clipped) * reduced;
+            y[group * 16 + lane] = cast_to_e2m1(clipped) * scale;
         }
     }
 }
 
-void gemv_nvfp4_rows(const std::uint8_t* packed, const std::uint8_t* scales, float scale2, const float* x, int rows,
-                     int cols, int row0, int row1, float* y) {
+void gemv_nvfp4_rows(const std::uint8_t* packed, const std::uint8_t* scales, float scale2, float input_scale,
+                     const float* x, int rows, int cols, int row0, int row1, float* y) {
     const int packed_cols = cols / 2;
     const int scale_cols = cols / 16;
+    const float alpha = scale2 * input_scale;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -549,7 +562,7 @@ void gemv_nvfp4_rows(const std::uint8_t* packed, const std::uint8_t* scales, flo
         const auto* scale_row = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(scale_cols);
         float acc = 0.f;
         for (int group = 0; group < scale_cols; ++group) {
-            const float scale = fp8_e4m3_to_f32(scale_row[group]) * scale2;
+            const float scale = fp8_e4m3_to_f32(scale_row[group]);
             const auto* bytes = packed_row + group * 8;
             const float* input = x + group * 16;
             for (int byte = 0; byte < 8; ++byte) {
@@ -558,7 +571,7 @@ void gemv_nvfp4_rows(const std::uint8_t* packed, const std::uint8_t* scales, flo
                 acc += e2m1(static_cast<std::uint8_t>(value >> 4U)) * scale * input[byte * 2 + 1];
             }
         }
-        y[row] = acc;
+        y[row] = acc * alpha;
     }
 }
 
@@ -622,11 +635,10 @@ public:
         for (std::size_t layer = 0; layer < spec_.layers.size(); ++layer) {
             mix(static_cast<int>(layer), spec_.layers[layer].mixer, "hc_attn_", "input_layernorm.weight");
             feed(static_cast<int>(layer), spec_.layers[layer].ffn);
-            // Serving kernels store each mHC stream in bf16. fp32 streams
-            // move a close argmax once the capture KDA state is present.
-            for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
             if (capture_taps_) record_tap(static_cast<int>(layer));
         }
+        // The last hc_post is stored bf16 before the contraction.
+        for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
         std::vector<float> mean(static_cast<std::size_t>(hidden_), 0.f);
         for (int dim = 0; dim < hidden_; ++dim) {
             float sum = 0.f;
@@ -830,13 +842,14 @@ private:
             fail("NVFP4 shape " + prefix);
         }
         // Dense MLP and routed experts both use ModelOpt W4A4. The block
-        // scales stay in checkpoint order; weight_scale_2 multiplies them.
+        // scales stay in checkpoint order. weight_scale_2 multiplies the
+        // finished dot once, together with input_scale.
         std::vector<float> quantized(static_cast<std::size_t>(cols));
         quant_dequant_nvfp4_activation(x, cols, input_scale, quantized.data());
         apply_rows(0, rows, [&](int row0, int row1) {
             gemv_nvfp4_rows(reinterpret_cast<const std::uint8_t*>(packed.data),
-                            reinterpret_cast<const std::uint8_t*>(scales.data), scale2, quantized.data(), rows, cols,
-                            row0, row1, y);
+                            reinterpret_cast<const std::uint8_t*>(scales.data), scale2, input_scale, quantized.data(),
+                            rows, cols, row0, row1, y);
         });
         if (link_fd_ >= 0) gather_rows(link_fd_, rank_, y, rows);
         for (int row = 0; row < rows; ++row) y[row] = bf16_to_f32(f32_to_bf16(y[row]));
@@ -859,8 +872,9 @@ private:
         const std::string prefix = layer_prefix(layer);
         std::vector<float> post(static_cast<std::size_t>(streams_));
         std::vector<float> comb(static_cast<std::size_t>(streams_ * streams_));
-        std::vector<float> residual = streams_state_;
         project_hc(prefix + hc_name, post.data(), comb.data());
+        for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
+        std::vector<float> residual = streams_state_;
         std::vector<float> norm(static_cast<std::size_t>(hidden_));
         store_.load(prefix + norm_name, norm.data(), hidden_);
         rmsnorm_stash(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
@@ -873,16 +887,15 @@ private:
         }
         dump_prompt_layer(layer, "attn", buf_a_.data(), hidden_);
         mhc_combine(residual.data(), buf_a_.data(), post.data(), comb.data(), streams_, hidden_, streams_state_.data());
-        // The fused hc_pre reads the bf16 hc_post residual.
-        for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
     }
 
     void feed(int layer, FfnKind ffn) {
         const std::string prefix = layer_prefix(layer);
         std::vector<float> post(static_cast<std::size_t>(streams_));
         std::vector<float> comb(static_cast<std::size_t>(streams_ * streams_));
-        std::vector<float> residual = streams_state_;
         project_hc(prefix + "hc_ffn_", post.data(), comb.data());
+        for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
+        std::vector<float> residual = streams_state_;
         std::vector<float> norm(static_cast<std::size_t>(hidden_));
         store_.load(prefix + "post_attention_layernorm.weight", norm.data(), hidden_);
         rmsnorm_stash(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
@@ -897,7 +910,7 @@ private:
         const int intermediate = static_cast<int>(spec_.intermediate_size);
         linear_nvfp4(prefix + "mlp.gate_proj", x, hidden_, buf_b_.data(), intermediate);
         linear_nvfp4(prefix + "mlp.up_proj", x, hidden_, buf_c_.data(), intermediate);
-        swiglu_clamp(buf_b_.data(), buf_c_.data(), intermediate, swiglu_limit_, buf_d_.data());
+        swiglu_clamp_bf16(buf_b_.data(), buf_c_.data(), intermediate, swiglu_limit_, buf_d_.data());
         linear_nvfp4(prefix + "mlp.down_proj", buf_d_.data(), intermediate, y, hidden_);
     }
 
@@ -1543,6 +1556,23 @@ void kda_recurrent_heads(float* state, const float* q, const float* k, const flo
     }
 }
 
+float round_bf16_store(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t lsb = (bits >> 16) & 1U;
+    if ((bits & 0x7fffffffU) > 0x7f800000U) {
+        const std::uint32_t wide = (bits >> 16) << 16;
+        float out = 0.f;
+        std::memcpy(&out, &wide, sizeof(out));
+        return out;
+    }
+    bits += 0x7fffU + lsb;
+    const std::uint32_t wide = (bits >> 16) << 16;
+    float out = 0.f;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
 void mhc_project(const float* streams, int hc, int hidden, const float* fn, const float* base, const float* scale,
                  float rms_eps, float hc_eps, int sinkhorn_iters, float* post, float* comb, float* collapsed) {
     const int coeff = (hc + 2) * hc;
@@ -1601,10 +1631,13 @@ void mhc_project(const float* streams, int hc, int hidden, const float* fn, cons
         normalize_rows();
         normalize_columns();
     }
+    // The fused pre dots the fp32 post output above, then collapses the bf16
+    // residual the post stored.
     for (int dim = 0; dim < hidden; ++dim) {
         float acc = 0.f;
         for (int stream = 0; stream < hc; ++stream) {
-            acc += pre[static_cast<std::size_t>(stream)] * streams[stream * hidden + dim];
+            const float stored = round_bf16_store(streams[stream * hidden + dim]);
+            acc += pre[static_cast<std::size_t>(stream)] * stored;
         }
         collapsed[dim] = acc;
     }
