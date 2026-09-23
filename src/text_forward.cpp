@@ -251,6 +251,19 @@ void rmsnorm(const float* x, const float* weight, int n, float eps, float* y) {
     for (int i = 0; i < n; ++i) y[i] = x[i] * inv * (weight != nullptr ? weight[i] : 1.f);
 }
 
+// TileLang stashes the collapsed stream sum in bf16, forms rsqrt from the fp32
+// sum, and stores the layer input in bf16.
+void rmsnorm_stash(const float* x, const float* weight, int n, float eps, float* y) {
+    float square = 0.f;
+    for (int i = 0; i < n; ++i) square += x[i] * x[i];
+    const float inv = 1.f / std::sqrt(square / static_cast<float>(n) + eps);
+    for (int i = 0; i < n; ++i) {
+        const float stashed = bf16_to_f32(f32_to_bf16(x[i]));
+        const float scaled = stashed * inv * (weight != nullptr ? weight[i] : 1.f);
+        y[i] = bf16_to_f32(f32_to_bf16(scaled));
+    }
+}
+
 struct Tensor {
     const std::byte* data = nullptr;
     std::int64_t shape[8]{};
@@ -471,6 +484,7 @@ private:
 };
 
 void gemv_bf16(const std::uint16_t* weight, const float* x, int rows, int cols, int row0, int row1, float* y) {
+    (void)rows;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -479,6 +493,47 @@ void gemv_bf16(const std::uint16_t* weight, const float* x, int rows, int cols, 
         float acc = 0.f;
         for (int col = 0; col < cols; ++col) acc += bf16_to_f32(line[col]) * x[col];
         y[row] = acc;
+    }
+}
+
+float cast_to_e2m1(float value) {
+    const float sign = std::copysign(1.f, value);
+    const float magnitude = std::fabs(value);
+    float snapped = 6.f;
+    if (magnitude <= 0.25f) snapped = 0.f;
+    else if (magnitude < 0.75f) snapped = 0.5f;
+    else if (magnitude <= 1.25f) snapped = 1.f;
+    else if (magnitude < 1.75f) snapped = 1.5f;
+    else if (magnitude <= 2.5f) snapped = 2.f;
+    else if (magnitude < 3.5f) snapped = 3.f;
+    else if (magnitude <= 5.f) snapped = 4.f;
+    return sign * snapped;
+}
+
+// ModelOpt W4A4. global_scale is 1/input_scale. Each 16-wide group is quantized
+// and restored before the weight dot, matching the FP4 GEMM reference.
+void quant_dequant_nvfp4_activation(const float* x, int cols, float input_scale, float* y) {
+    if (!(input_scale > 0.f) || !std::isfinite(input_scale) || cols % 16 != 0) fail("NVFP4 input scale");
+    const float global_scale = 1.f / input_scale;
+    for (int group = 0; group < cols / 16; ++group) {
+        float rounded[16];
+        float peak = 0.f;
+        for (int lane = 0; lane < 16; ++lane) {
+            rounded[lane] = bf16_to_f32(f32_to_bf16(x[group * 16 + lane]));
+            peak = std::max(peak, std::fabs(rounded[lane]));
+        }
+        float scale = global_scale * (peak / 6.f);
+        if (scale > 448.f) scale = 448.f;
+        if (scale < -448.f) scale = -448.f;
+        scale = fp8_e4m3_to_f32(f32_to_e4m3(scale));
+        const float reduced = scale / global_scale;
+        const float output_scale = 1.f / (reduced + (reduced == 0.f ? 1.0e8f : 0.f));
+        for (int lane = 0; lane < 16; ++lane) {
+            float clipped = rounded[lane] * output_scale;
+            if (clipped > 6.f) clipped = 6.f;
+            if (clipped < -6.f) clipped = -6.f;
+            y[group * 16 + lane] = cast_to_e2m1(clipped) * reduced;
+        }
     }
 }
 
@@ -617,7 +672,8 @@ public:
         float square = 0.f;
         for (int dim = 0; dim < hidden_; ++dim) square += final_[static_cast<std::size_t>(dim)] * final_[static_cast<std::size_t>(dim)];
         std::cerr << "final_rms=" << std::sqrt(square / static_cast<float>(hidden_)) << " best=" << best
-                  << " logit=" << best_value << " second=" << second << " logit2=" << second_value << '\n';
+                  << " logit=" << best_value << " second=" << second << " logit2=" << second_value
+                  << " id13041=" << logits[13041] << " id198=" << logits[198] << '\n';
         last_margin_ = best_value - second_value;
         if (rank_ == 0) {
             if (const char* dump = std::getenv("NINFER_HIDDEN_DUMP"); dump != nullptr && dump[0] != '\0') {
@@ -699,6 +755,22 @@ public:
     }
 
 private:
+    void dump_prompt_layer(int layer, const char* tag, const float* data, int count) {
+        const bool conv_tag = std::strncmp(tag, "conv-", 5) == 0;
+        const bool prompt = seen_ == 1 && layer <= 3;
+        const bool prime_conv = seen_ == 0 && conv_tag && layer == 0;
+        const bool generated = seen_ == 2 && layer == 0;
+        if (!prompt && !prime_conv && !generated) return;
+        const char* dir = std::getenv("NINFER_LAYER_DUMP");
+        if (dir == nullptr || dir[0] == '\0') return;
+        double square = 0.0;
+        for (int i = 0; i < count; ++i) square += static_cast<double>(data[i]) * static_cast<double>(data[i]);
+        std::cerr << "tap L" << layer << " s" << seen_ << ' ' << tag << " nrm=" << std::sqrt(square) << " y0=" << data[0] << '\n';
+        const std::string path = std::string(dir) + "/L" + std::to_string(layer) + "-s" + std::to_string(seen_) + "-" + tag + ".bin";
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count) * 4);
+    }
+
     void record_tap(int layer) {
         const int ids[5] = {5, 14, 24, 33, 42};
         for (int index = 0; index < 5; ++index) {
@@ -749,6 +821,7 @@ private:
         const auto& packed = store_.get(prefix + ".weight");
         const auto& scales = store_.get(prefix + ".weight_scale");
         const float scale2 = store_.scalar(prefix + ".weight_scale_2");
+        const float input_scale = store_.scalar(prefix + ".input_scale");
         if (packed.kind != 'u' || scales.kind != '8' || packed.rank != 2 || scales.rank != 2) {
             fail("NVFP4 layout " + prefix);
         }
@@ -756,11 +829,17 @@ private:
             dim_at(scales, 1) != cols / 16) {
             fail("NVFP4 shape " + prefix);
         }
+        // Dense MLP and routed experts both use ModelOpt W4A4. The block
+        // scales stay in checkpoint order; weight_scale_2 multiplies them.
+        std::vector<float> quantized(static_cast<std::size_t>(cols));
+        quant_dequant_nvfp4_activation(x, cols, input_scale, quantized.data());
         apply_rows(0, rows, [&](int row0, int row1) {
             gemv_nvfp4_rows(reinterpret_cast<const std::uint8_t*>(packed.data),
-                            reinterpret_cast<const std::uint8_t*>(scales.data), scale2, x, rows, cols, row0, row1, y);
+                            reinterpret_cast<const std::uint8_t*>(scales.data), scale2, quantized.data(), rows, cols,
+                            row0, row1, y);
         });
         if (link_fd_ >= 0) gather_rows(link_fd_, rank_, y, rows);
+        for (int row = 0; row < rows; ++row) y[row] = bf16_to_f32(f32_to_bf16(y[row]));
     }
 
     void project_hc(const std::string& name_prefix, float* post, float* comb) {
@@ -784,10 +863,18 @@ private:
         project_hc(prefix + hc_name, post.data(), comb.data());
         std::vector<float> norm(static_cast<std::size_t>(hidden_));
         store_.load(prefix + norm_name, norm.data(), hidden_);
-        rmsnorm(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
+        rmsnorm_stash(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
+        dump_prompt_layer(layer, "attn-in", branch_.data(), hidden_);
         if (mixer == MixerKind::kKda) kda(layer, branch_.data(), buf_a_.data());
         else mla(layer, branch_.data(), buf_a_.data());
+        // o_proj is stored bf16 before hc_post. The fp32 tail is not consumed.
+        for (int dim = 0; dim < hidden_; ++dim) {
+            buf_a_[static_cast<std::size_t>(dim)] = bf16_to_f32(f32_to_bf16(buf_a_[static_cast<std::size_t>(dim)]));
+        }
+        dump_prompt_layer(layer, "attn", buf_a_.data(), hidden_);
         mhc_combine(residual.data(), buf_a_.data(), post.data(), comb.data(), streams_, hidden_, streams_state_.data());
+        // The fused hc_pre reads the bf16 hc_post residual.
+        for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
     }
 
     void feed(int layer, FfnKind ffn) {
@@ -798,9 +885,11 @@ private:
         project_hc(prefix + "hc_ffn_", post.data(), comb.data());
         std::vector<float> norm(static_cast<std::size_t>(hidden_));
         store_.load(prefix + "post_attention_layernorm.weight", norm.data(), hidden_);
-        rmsnorm(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
+        rmsnorm_stash(collapsed_.data(), norm.data(), hidden_, rms_eps_, branch_.data());
+        dump_prompt_layer(layer, "mlp-in", branch_.data(), hidden_);
         if (ffn == FfnKind::kDense) dense_mlp(prefix, branch_.data(), buf_a_.data());
         else moe(prefix, branch_.data(), buf_a_.data());
+        dump_prompt_layer(layer, "ffn", buf_a_.data(), hidden_);
         mhc_combine(residual.data(), buf_a_.data(), post.data(), comb.data(), streams_, hidden_, streams_state_.data());
     }
 
@@ -827,6 +916,25 @@ private:
         std::vector<int> indices(static_cast<std::size_t>(top_k_));
         std::vector<float> weights(static_cast<std::size_t>(top_k_));
         router_select(buf_b_.data(), bias.data(), experts_, top_k_, scaling_, true, indices.data(), weights.data());
+        if (seen_ == 1) {
+            if (const char* dir = std::getenv("NINFER_LAYER_DUMP"); dir != nullptr && dir[0] != '\0') {
+                const auto mark = prefix.find("layers.");
+                const int layer_id = mark == std::string::npos ? -1 : std::atoi(prefix.c_str() + mark + 7);
+                std::cerr << "route L" << layer_id;
+                for (int pick = 0; pick < top_k_; ++pick) {
+                    std::cerr << ' ' << indices[static_cast<std::size_t>(pick)] << ':'
+                              << weights[static_cast<std::size_t>(pick)];
+                }
+                if (layer_id == 4 || layer_id == 9) {
+                    const int watch = layer_id == 4 ? 86 : 11;
+                    const int eighth = indices[static_cast<std::size_t>(top_k_ - 1)];
+                    const float left = sigmoid(buf_b_[watch]) + bias[static_cast<std::size_t>(watch)];
+                    const float right = sigmoid(buf_b_[static_cast<std::size_t>(eighth)]) + bias[static_cast<std::size_t>(eighth)];
+                    std::cerr << " watch=" << watch << " c=" << left << " eighth=" << eighth << " c8=" << right;
+                }
+                std::cerr << '\n';
+            }
+        }
         std::fill(y, y + hidden_, 0.f);
         for (int pick = 0; pick < top_k_; ++pick) {
             const std::string expert = prefix + "mlp.experts." + std::to_string(indices[static_cast<std::size_t>(pick)]) + ".";
@@ -847,6 +955,11 @@ private:
         linear_bf16(prefix + "q_proj.weight", x, hidden_, buf_b_.data(), qkv_);
         linear_bf16(prefix + "k_proj.weight", x, hidden_, buf_c_.data(), qkv_);
         linear_bf16(prefix + "v_proj.weight", x, hidden_, buf_d_.data(), qkv_);
+        for (int lane = 0; lane < qkv_; ++lane) {
+            buf_b_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_b_[static_cast<std::size_t>(lane)]));
+            buf_c_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_c_[static_cast<std::size_t>(lane)]));
+            buf_d_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_d_[static_cast<std::size_t>(lane)]));
+        }
         const auto& q_weight = store_.get(prefix + "q_conv1d.weight");
         const auto& k_weight = store_.get(prefix + "k_conv1d.weight");
         const auto& v_weight = store_.get(prefix + "v_conv1d.weight");
@@ -859,20 +972,50 @@ private:
                          buf_c_.data());
         causal_conv_silu(buf_d_.data(), reinterpret_cast<const float*>(v_weight.data), cache.v_mem.data(), qkv_, kernel_,
                          buf_d_.data());
+        // The short-conv kernel stores silu(conv) as bf16. The fp32 tail is not consumed.
+        for (int lane = 0; lane < qkv_; ++lane) {
+            buf_b_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_b_[static_cast<std::size_t>(lane)]));
+            buf_c_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_c_[static_cast<std::size_t>(lane)]));
+            buf_d_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_d_[static_cast<std::size_t>(lane)]));
+        }
+        dump_prompt_layer(layer, "conv-q", buf_b_.data(), qkv_);
+        dump_prompt_layer(layer, "conv-k", buf_c_.data(), qkv_);
+        dump_prompt_layer(layer, "conv-v", buf_d_.data(), qkv_);
         linear_bf16(prefix + "f_a_proj.weight", x, hidden_, buf_a_.data(), head_dim_);
+        for (int lane = 0; lane < head_dim_; ++lane) {
+            buf_a_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_a_[static_cast<std::size_t>(lane)]));
+        }
         linear_bf16(prefix + "f_b_proj.weight", buf_a_.data(), head_dim_, final_.data(), qkv_);
         std::vector<float> dt_bias(static_cast<std::size_t>(qkv_));
         std::vector<float> a_log(static_cast<std::size_t>(heads_));
         std::vector<float> forget(static_cast<std::size_t>(qkv_));
         store_.load(prefix + "dt_bias", dt_bias.data(), qkv_);
         store_.load(prefix + "A_log", a_log.data(), heads_);
+        for (int lane = 0; lane < qkv_; ++lane) {
+            final_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(final_[static_cast<std::size_t>(lane)]));
+        }
         kda_forget_gate(final_.data(), dt_bias.data(), a_log.data(), lower_bound_, heads_, head_dim_, forget.data());
         linear_bf16(prefix + "b_proj.weight", x, hidden_, buf_a_.data(), heads_);
-        for (int head = 0; head < heads_; ++head) buf_a_[static_cast<std::size_t>(head)] = sigmoid(buf_a_[static_cast<std::size_t>(head)]);
+        for (int head = 0; head < heads_; ++head) {
+            buf_a_[static_cast<std::size_t>(head)] =
+                sigmoid(bf16_to_f32(f32_to_bf16(buf_a_[static_cast<std::size_t>(head)])));
+        }
         kda_recurrent_heads(cache.state.data(), buf_b_.data(), buf_c_.data(), buf_d_.data(), forget.data(), buf_a_.data(),
                             heads_, head_dim_, buf_b_.data());
+        // The kernel stores the recurrent output as bf16. The fp32 tail is the
+        // whole gap versus the official layer-0 dump once q/k/v match.
+        for (int lane = 0; lane < qkv_; ++lane) {
+            buf_b_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_b_[static_cast<std::size_t>(lane)]));
+        }
+        dump_prompt_layer(layer, "recur", buf_b_.data(), qkv_);
         linear_bf16(prefix + "g_a_proj.weight", x, hidden_, buf_a_.data(), head_dim_);
+        for (int lane = 0; lane < head_dim_; ++lane) {
+            buf_a_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_a_[static_cast<std::size_t>(lane)]));
+        }
         linear_bf16(prefix + "g_b_proj.weight", buf_a_.data(), head_dim_, buf_c_.data(), qkv_);
+        for (int lane = 0; lane < qkv_; ++lane) {
+            buf_c_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_c_[static_cast<std::size_t>(lane)]));
+        }
         std::vector<float> o_norm(static_cast<std::size_t>(head_dim_));
         store_.load(prefix + "o_norm.weight", o_norm.data(), head_dim_);
         for (int head = 0; head < heads_; ++head) {
@@ -881,6 +1024,10 @@ private:
             rmsnorm(row, o_norm.data(), head_dim_, rms_eps_, row);
             for (int dim = 0; dim < head_dim_; ++dim) row[dim] *= sigmoid(gate[dim]);
         }
+        for (int lane = 0; lane < qkv_; ++lane) {
+            buf_b_[static_cast<std::size_t>(lane)] = bf16_to_f32(f32_to_bf16(buf_b_[static_cast<std::size_t>(lane)]));
+        }
+        dump_prompt_layer(layer, "oproj-in", buf_b_.data(), qkv_);
         linear_bf16(prefix + "o_proj.weight", buf_b_.data(), qkv_, y, hidden_);
     }
 
@@ -1400,14 +1547,19 @@ void mhc_project(const float* streams, int hc, int hidden, const float* fn, cons
                  float rms_eps, float hc_eps, int sinkhorn_iters, float* post, float* comb, float* collapsed) {
     const int coeff = (hc + 2) * hc;
     const int flat_n = hc * hidden;
-    std::vector<float> normed(static_cast<std::size_t>(flat_n));
+    // The mHC kernel dots the raw streams, then multiplies by rsqrt.
+    // Scaling each lane before the dot flips a few bf16 norm lanes.
+    double square = 0.0;
+    for (int col = 0; col < flat_n; ++col) square += static_cast<double>(streams[col]) * streams[col];
+    const float inv = 1.f / std::sqrt(static_cast<float>(square / static_cast<double>(flat_n)) + rms_eps);
     std::vector<float> mixed(static_cast<std::size_t>(coeff));
-    rmsnorm(streams, nullptr, flat_n, rms_eps, normed.data());
     for (int row = 0; row < coeff; ++row) {
         const float* weight = fn + static_cast<std::size_t>(row) * static_cast<std::size_t>(flat_n);
-        float acc = 0.f;
-        for (int col = 0; col < flat_n; ++col) acc += weight[col] * normed[static_cast<std::size_t>(col)];
-        mixed[static_cast<std::size_t>(row)] = acc;
+        double acc = 0.0;
+        for (int col = 0; col < flat_n; ++col) {
+            acc += static_cast<double>(weight[col]) * static_cast<double>(streams[col]);
+        }
+        mixed[static_cast<std::size_t>(row)] = static_cast<float>(acc) * inv;
     }
     std::vector<float> pre(static_cast<std::size_t>(hc));
     for (int stream = 0; stream < hc; ++stream) {
